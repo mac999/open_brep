@@ -6,7 +6,9 @@ Representation (B-Rep) kernel on a pure half-edge data structure, manipulated on
 through atomic **Euler operators**, with a clean MVC separation between topology,
 geometry, high-level modeling and the CLI.
 
-> Implements the design in [`PRD.md`](PRD.md).
+<p align="center">
+<img src="./doc/img1.png" height="200"></img>
+</p>
 
 ## Why this exists
 
