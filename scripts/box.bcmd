@@ -1,0 +1,7 @@
+# box.bcmd - build a unit-ish box from the high-level macro and validate it.
+# Lines starting with '#' or '//' are comments.
+
+create box 10 20 30 as #1
+disp topology #1
+check validity #1
+disp vertices #1

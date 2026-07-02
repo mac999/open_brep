@@ -1,0 +1,77 @@
+// extend_examples.bcmd
+// =============================================================================
+// Extend demonstrations: grow a SOURCE entity until it MEETS a TARGET entity.
+//
+// The whole point of 'extend' is that source and target must be arranged so the
+// source's extension path actually crosses the target -- placed at a right angle
+// or an oblique angle, NOT parallel (parallel targets are never reached, or only
+// give a trivial straight offset). Every example below sets up a real crossing.
+//
+// Reuses the same intersection math as trim (line-plane closed form, ray-surface
+// over the tessellation). Both geometry (a new point ON the target) and topology
+// (a new vertex/edge, or a swept strip of faces) are updated.
+//
+// Each example saves two STEP files into scripts/extend_out/ :
+//     NN_<name>_before.step   the source before extending
+//     NN_<name>_after.step     the source grown onto the target
+//
+// Source-target combinations covered:
+//     curve - plane   (Example 1)      plane - plane   (Example 3)
+//     curve - nurbs   (Example 2)      plane - nurbs   (Example 4)
+// =============================================================================
+
+
+// -- Example 1: CURVE -> PLANE  (wire meets a perpendicular wall) -------------
+// A short horizontal wire pointing +x. The target plane x=20 is a VERTICAL wall
+// standing across its path at a right angle, so the tangent ray hits it head-on
+// and the wire grows from x=6 out to x=20.
+micro mvfs 0 0 0 as @w1
+micro mev $vertex 6 0 0                             // wire (0,0,0)->(6,0,0), tangent +x
+save "scripts/extend_out/01_curve_plane_before.step" @w1
+extend $edge to plane 1 0 0 20                      // wall x=20 is perpendicular -> hits (20,0,0)
+check validity @w1
+disp math $edge                                    // straight extension to (20,0,0)
+save "scripts/extend_out/01_curve_plane_after.step" @w1
+list
+
+
+// -- Example 2: CURVE -> NURBS  (wire rises into a dome above it) --------------
+// A vertical wire sits BELOW the dome and points +z straight at it. The ray meets
+// the curved surface and the wire tip lands on the dome (its apex at z=4).
+create nurbs 20 8 as @dome2
+set @df2 $face                                     // capture the dome's NURBS face
+micro mvfs 0 0 -6 as @w2
+micro mev $vertex 0 0 -3                            // wire below the dome, tangent +z
+save "scripts/extend_out/02_curve_nurbs_before.step" @w2
+extend $edge to @df2                               // ray +z pierces the dome surface
+check validity @w2
+disp math $edge                                    // extension ends on the surface (0,0,4)
+save "scripts/extend_out/02_curve_nurbs_after.step" @w2
+list
+
+
+// -- Example 3: PLANE -> PLANE  (sheet grows onto a SLANTED plane => ramp) -----
+// A flat 20x20 sheet in the XY plane. The target is the SLANTED plane
+// z = 10 + 0.5*x  (normal (-0.5,0,1), d=10) -- deliberately NOT parallel to the
+// sheet, so each corner is swept up to a different height and the new cap is a
+// ramp (x=-10 -> z=5, x=+10 -> z=15), clearly showing the extend reached an angle.
+create plane 20 20 as @s3
+save "scripts/extend_out/03_plane_plane_before.step" @s3
+extend $face to plane -0.5 0 1 10
+check validity @s3
+save "scripts/extend_out/03_plane_plane_after.step" @s3
+list
+
+
+// -- Example 4: PLANE -> NURBS  (sheet grows up onto a curved dome) ------------
+// A flat sheet parked below the dome, swept straight up (+z) onto the surface.
+// Each swept vertex stops on the dome, so the new cap CONFORMS to the curvature.
+create nurbs 20 8 as @dome4
+set @df4 $face                                     // the dome's NURBS face
+create plane 12 12 as @sheet4                       // flat sheet, then drop it below
+move @sheet4 0 0 -4
+save "scripts/extend_out/04_plane_nurbs_before.step" @sheet4
+extend $face to @df4
+check validity @sheet4
+save "scripts/extend_out/04_plane_nurbs_after.step" @sheet4
+list

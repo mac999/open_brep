@@ -1,0 +1,4 @@
+numpy>=1.21
+plotly>=5.0          # 3-D viewer — browser-based, numpy-free (primary backend)
+vedo>=2023.0         # 3-D viewer — VTK window (optional, requires working numpy)
+matplotlib>=3.5      # 3-D viewer — fallback if vedo/plotly unavailable

@@ -1,0 +1,27 @@
+# geom.bcmd - Bezier edges, NURBS faces, revolve and trim, using only symbolic
+# references (no hardcoded auto-ids).  Inline comments use '//'.
+
+// --- Bezier edge + curve trim ---
+micro mvfs 0 0 0
+set @a $vertex             // first endpoint
+micro mev $vertex 10 0 0
+set @b $vertex             // second endpoint
+set @e $edge               // the edge we just made
+setcurve @e as bezier @a @b
+disp math @e
+trim curve @e at 0.5       // splits the Bezier; @e keeps the left half
+disp math @e
+
+// --- box face -> NURBS surface ---
+create box 4 4 4 as @box
+setsurface $face as nurbs 1 1   // $face = the box's last-created face
+disp math $face
+
+// --- revolve a triangle profile a quarter turn ---
+micro mvfs 5 0 0
+set @r0 $vertex
+micro mev $vertex 7 0 0
+micro mev $vertex 6 0 2
+micro mef $vertex @r0      // close the profile -> $face is the new face
+revolve $face z 90 3
+check validity $solid

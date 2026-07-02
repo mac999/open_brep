@@ -1,0 +1,23 @@
+# features.bcmd - geometry assignment, transforms, trim, and STEP I/O.
+# Uses @aliases and $last references throughout. Inline comments use '//'.
+
+create box 10 10 10 as @b
+
+// --- geometry editing ---
+disp math $face            // inspect the box's last face
+setpoint $vertex as (1, 1, 1)
+disp math $vertex
+
+// --- transforms (operate on the whole solid @b) ---
+move @b 5 0 0
+rotate @b z 45
+scale @b 2
+
+// --- query ---
+disp vertices @b
+check validity @b
+
+// --- STEP round trip ---
+save "scripts/out_box.step" @b
+load "scripts/out_box.step"
+list

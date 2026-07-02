@@ -1,0 +1,25 @@
+# examples.bcmd - build the main example solids, validate each, and export STEP.
+# STEP files are written under scripts/out/ (created automatically).
+
+// --- cube ---
+create box 10 10 10 as @cube
+check validity @cube
+save "scripts/out/cube.step" @cube
+
+// --- sphere (UV, 24 longitude x 12 latitude) ---
+create sphere 5 24 12 as @sphere
+check validity @sphere
+save "scripts/out/sphere.step" @sphere
+
+// --- cylinder (radius 4, height 12, 24 facets) ---
+create cylinder 4 12 24 as @cyl
+check validity @cyl
+save "scripts/out/cylinder.step" @cyl
+
+// --- NURBS dome surface (degree 2x2) ---
+create nurbs 10 4 as @srf
+check validity @srf
+disp math $face
+save "scripts/out/nurbs.step" @srf
+
+list

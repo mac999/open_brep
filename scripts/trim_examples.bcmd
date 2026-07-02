@@ -1,0 +1,129 @@
+// trim_examples.bcmd
+// =============================================================================
+// Trim demonstrations for the B-Rep CLI kernel.
+//
+// The cutting plane and the solid are arranged so the plane genuinely slices
+// THROUGH the solid -- perpendicular or oblique, never merely grazing or lying
+// on a face. That is what shows a real intersection: an oblique plane cuts a box
+// corner at an angle, a slanted plane cuts a cylinder into an ellipse, etc.
+//
+// Every example saves two STEP files into scripts/trim_out/ :
+//     NN_<name>_before.step   the untrimmed input
+//     NN_<name>_after.step     the trimmed result (the kept side)
+//
+// How trim works (geometry-aware: BOTH topology and geometry are updated) -----
+//   1. Each edge crossing the plane is split at the TRUE intersection (on the
+//      Bezier curve if the edge carries one, else on the straight chord).
+//   2. Each straddling face is MEF-split into keep/discard halves; an analytic
+//      NURBS keep-half is reparameterized by De Casteljau.
+//   3. A curved face whose SURFACE crosses the plane while its flat boundary does
+//      not (a cap cut) is kept and faceted along the true surface-plane section.
+//   4. Discard faces are dropped from the STEP export (OPEN_SHELL).
+//   The in-memory topology stays a valid closed manifold, so 'check validity'
+//   passes after every trim.
+//
+// Command reference ----------------------------------------------------------
+//   trim #<solid> by plane <nx> <ny> <nz> <d> [keep above|below]
+//   trim surface #<face> keep <u0> <u1> <v0> <v1>
+//   trim curve #<edge> at <u>
+// =============================================================================
+
+
+// -- Example 1: Plane lamina, PERPENDICULAR cut, KEEP ABOVE (y>3) --------------
+// A horizontal 20x20 sheet sliced by the vertical plane y=3 (perpendicular to
+// the sheet), keeping the y>3 strip.
+create plane 20 20 as @pl
+save "scripts/trim_out/01_plane_before.step" @pl
+trim @pl by plane 0 1 0 3 keep above
+check validity @pl
+save "scripts/trim_out/01_plane_after.step" @pl
+list
+
+
+// -- Example 2: Same cut, KEEP BELOW (y<3) ------------------------------------
+// Direction option: identical reference plane, the opposite (y<3) strip survives.
+create plane 20 20 as @pb
+save "scripts/trim_out/02_plane_below_before.step" @pb
+trim @pb by plane 0 1 0 3 keep below
+check validity @pb
+save "scripts/trim_out/02_plane_below_after.step" @pb
+list
+
+
+// -- Example 3: Box, OBLIQUE cut  x+y+z=15  (corner sliced at an angle) --------
+// The plane crosses three faces diagonally, lopping off the far corner. Crossing
+// edges are split at the exact intersection and each straddling face MEF-cut.
+create box 10 10 10 as @bx
+save "scripts/trim_out/03_box_oblique_before.step" @bx
+trim @bx by plane 1 1 1 15 keep above
+check validity @bx
+save "scripts/trim_out/03_box_oblique_after.step" @bx
+list
+
+
+// -- Example 4: Cylinder, SLANTED cut -> elliptical section --------------------
+// r=6, h=12 cylinder cut by the slanted plane z = 0.6x + 6 (normal -0.6,0,1).
+// The plane meets the round wall at an angle, so the kept top is a slanted ellipse.
+create cylinder 6 12 24 as @cy
+save "scripts/trim_out/04_cylinder_slanted_before.step" @cy
+trim @cy by plane -0.6 0 1 6 keep above
+check validity @cy
+save "scripts/trim_out/04_cylinder_slanted_after.step" @cy
+list
+
+
+// -- Example 5: Sphere, SLANTED cap cut (not the equator) ---------------------
+// r=10 sphere cut by the tilted plane z = 0.5x + 3, giving an off-axis cap.
+create sphere 10 as @sp
+save "scripts/trim_out/05_sphere_slanted_before.step" @sp
+trim @sp by plane -0.5 0 1 3 keep above
+check validity @sp
+save "scripts/trim_out/05_sphere_slanted_after.step" @sp
+list
+
+
+// -- Example 6: NURBS dome, VERTICAL cut x>0 (boundary crosses -> analytic) ----
+// The flat boundary DOES cross x=0, so the surface is reparameterized and still
+// exports as an analytic B_SPLINE_SURFACE_WITH_KNOTS spanning only the x>0 half.
+create nurbs 20 8 as @nv
+save "scripts/trim_out/06_nurbs_vertical_before.step" @nv
+trim @nv by plane 1 0 0 0 keep above
+check validity @nv
+disp math $face                                    // control net cropped to x>0
+save "scripts/trim_out/06_nurbs_vertical_after.step" @nv
+list
+
+
+// -- Example 7: NURBS dome, HORIZONTAL CAP cut z>3 (surface crosses -> faceted)-
+// The dome is a flat lamina (all corner verts at z=0) with a surface rising to
+// z~4. A horizontal plane crosses NO edge, so a polygon-only trim would miss it.
+// The geometry-aware trim samples the SURFACE and keeps the curved cap above z=3,
+// exported as a faceted OPEN_SHELL following the true surface-plane intersection.
+create nurbs 20 8 as @cap
+save "scripts/trim_out/07_nurbs_cap_before.step" @cap
+trim @cap by plane 0 0 1 3 keep above
+check validity @cap
+disp math $face                                    // "kept +side, faceted ..."
+save "scripts/trim_out/07_nurbs_cap_after.step" @cap
+list
+
+
+// -- Example 8: NURBS surface crop to central quarter -------------------------
+// Not a plane cut: resize the NURBS face to the kept uv window [0.25,0.75]^2.
+create nurbs 20 8 as @cr
+save "scripts/trim_out/08_nurbs_crop_before.step" @cr
+trim surface $face keep 0.25 0.75 0.25 0.75
+disp math $face                                    // shows trim surface region
+save "scripts/trim_out/08_nurbs_crop_after.step" @cr
+list
+
+
+// -- Example 9: Curve split (keeps both halves) -------------------------------
+// A pure split, not a discard: one boundary edge becomes two connected edges,
+// adding one vertex (a Bezier, if attached, is subdivided by De Casteljau).
+create plane 10 10 as @cv
+save "scripts/trim_out/09_curve_before.step" @cv
+trim curve $edge at 0.5
+check validity @cv
+save "scripts/trim_out/09_curve_after.step" @cv
+list

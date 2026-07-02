@@ -1,0 +1,18 @@
+# manual_box.bcmd - build a box from raw Micro Euler operators WITHOUT hardcoding
+# any auto-assigned id. Symbolic references make the script robust:
+#   $vertex / $edge / $face  = the last entity of that kind that was created
+#   @name                    = a user alias bound with 'as @name' or 'set'
+# Inline comments use '//' (since '#' collides with #ids).
+
+micro mvfs 0 0 0
+set @v0 $vertex            // remember the very first vertex (the seed)
+micro mev $vertex 10 0 0   // spike off the latest vertex each time
+micro mev $vertex 10 10 0
+micro mev $vertex 0 10 0
+micro mef $vertex @v0      // close the square back to v0 -> makes a new face
+check validity $solid
+
+extrude $face 0 0 5        // sweep the just-created face into a box
+check validity $solid
+vars
+disp topology $solid
