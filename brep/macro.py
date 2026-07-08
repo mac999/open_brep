@@ -12,9 +12,12 @@ import math
 from typing import List, Optional, Tuple
 
 from . import euler_ops as eu
-from .geometry import (Bezier, NURBSSurface, Point3D, TrimPlane,
+from .geometry import (Bezier, NURBSSurface, Point3D, SurfaceCutter, TrimPlane,
                        bezier_plane_param, line_plane_intersect,
-                       ray_surface_intersect, surface_plane_side)
+                       ray_surface_intersect, ray_surface_intersect_ex,
+                       surface_closest_point, surface_directional_derivs,
+                       surface_normal, surface_plane_section,
+                       surface_plane_side, surface_surface_section)
 from .mesh import build_solid_from_faces
 from .model import Kernel
 from .topology import Edge, Face, Solid, Vertex
@@ -582,6 +585,169 @@ def _reparameterize_keep_nurbs(face: Face, plane: TrimPlane) -> None:
         face.surface = high_s if d_low_centre < 0.0 else low_s
 
 
+def _insert_section_ring(kernel: Kernel, face: Face,
+                         section: List[Tuple[float, float, Point3D]]) -> Face:
+    """
+    Lift a closed surface–plane section curve into the half-edge topology of
+    ``face`` as a real inner ring, splitting the face in two.
+
+    Classic Mäntylä bridge construction, using only Euler operators so the
+    invariant is preserved by construction (net: +nV +nE +1F +1R → ΔEuler = 0):
+
+        1. MEV a *bridge* edge from a boundary vertex of the face to the first
+           section point, then MEV-chain the remaining section points (spikes).
+        2. MEF between the chain's last and first vertices — this closes the
+           section loop and splits off the *cap* face bounded exactly by it.
+        3. KEMR kills the bridge edge, turning the section cycle inside the
+           remaining face into a proper inner **ring**.
+
+    Each new vertex stores its surface parameters in ``vertex.on_surface_uv``
+    (the parametric reconnection of the intersection); each section edge gets a
+    straight chord Bezier. Returns the new cap face (bounded by the section);
+    the original ``face`` keeps its outer boundary plus the new ring.
+    """
+    if len(section) < 3:
+        raise ValueError("section ring needs at least 3 points")
+    loop = face.outer
+
+    # 1) Bridge from an outer-boundary corner to the first section point.
+    anchor_he = loop.halfedge
+    anchor_v = anchor_he.vertex
+    u0, v0, p0 = section[0]
+    bridge_edge, first_v = eu.mev(kernel, anchor_v, p0, he_ref=anchor_he)
+    first_v.on_surface_uv = (u0, v0)          # type: ignore[attr-defined]
+
+    verts = [first_v]
+    prev = first_v
+    for (su, sv, sp) in section[1:]:
+        chain_edge, nv = eu.mev(kernel, prev, sp, he_ref=prev.halfedge)
+        nv.on_surface_uv = (su, sv)           # type: ignore[attr-defined]
+        chain_edge.curve = Bezier([prev.point, sp])
+        verts.append(nv)
+        prev = nv
+
+    # 2) Close the loop: he1 = first->second (so the section cycle becomes the
+    #    new cap face), he2 = the chain tip's only outgoing half-edge.
+    he1 = None
+    for he in loop.halfedges():
+        if he.vertex is verts[0] and he.end_vertex is verts[1]:
+            he1 = he
+            break
+    he2 = eu.find_outgoing_in_loop(loop, verts[-1])
+    if he1 is None or he2 is None:
+        raise RuntimeError("section ring lost its chain half-edges")
+    closing_edge, cap_face = eu._mef(kernel, he1, he2)
+    closing_edge.curve = Bezier([verts[-1].point, verts[0].point])
+
+    # 3) Remove the bridge; its two half-edges now bound the same loop, so KEMR
+    #    detaches the section cycle into an inner ring of the original face.
+    eu.kemr(kernel, bridge_edge.he1)
+    return cap_face
+
+
+def _resample_closed(pts: List[Tuple[float, float, Point3D]],
+                     n: int) -> List[Tuple[float, float, Point3D]]:
+    """Evenly subsample a closed section polyline to at most ``n`` points."""
+    # Drop consecutive near-duplicates first (marching artifacts at nodes).
+    clean: List[Tuple[float, float, Point3D]] = []
+    for item in pts:
+        if not clean or (item[2] - clean[-1][2]).length() > 1e-9:
+            clean.append(item)
+    if len(clean) > 1 and (clean[0][2] - clean[-1][2]).length() <= 1e-9:
+        clean.pop()
+    if len(clean) <= n:
+        return clean
+    step = len(clean) / n
+    return [clean[int(k * step)] for k in range(n)]
+
+
+def _section_ring_trim(kernel: Kernel, face: Face,
+                       plane: TrimPlane) -> Optional[Face]:
+    """
+    Topological realisation of an interior (cap) surface–plane cut.
+
+    Extracts the section curve in the surface's ``(u, v)`` space
+    (:func:`geometry.surface_plane_section`), lifts the single closed loop into
+    the half-edge structure with :func:`_insert_section_ring` (cap face + inner
+    ring), then flags the half on the − side as discarded. The keep half owns
+    the NURBS surface plus the ``trim_plane`` tag that drives clipped
+    tessellation in the viewer and STEP export.
+
+    Returns the discarded half-face, or ``None`` when no single closed section
+    loop exists (the face then stays tagged-only, as before).
+    """
+    surf = face.surface
+    loops = surface_plane_section(surf, plane)
+    closed = [pts for is_closed, pts in loops if is_closed and len(pts) >= 6]
+    if len(closed) != 1:
+        return None
+    section = _resample_closed(closed[0], 24)
+    if len(section) < 3:
+        return None
+
+    # Which side of the plane is *inside* the section loop? Probe the surface
+    # at the loop's uv centroid (interior for a star-shaped cap loop).
+    uc = sum(u for u, _v, _p in section) / len(section)
+    vc = sum(v for _u, v, _p in section) / len(section)
+    inner_sign = plane.signed_distance(surf.evaluate(uc, vc))
+
+    try:
+        cap = _insert_section_ring(kernel, face, section)
+    except (ValueError, RuntimeError):
+        return None                            # keep tagged-only fallback
+
+    if inner_sign > 0.0:                       # cap region is the keep (+) side
+        keep_half, discard_half = cap, face
+    else:                                      # annulus keeps, cap discarded
+        keep_half, discard_half = face, cap
+    keep_half.surface = surf
+    keep_half.trim_plane = plane               # type: ignore[attr-defined]
+    if discard_half is not keep_half:
+        discard_half.surface = None
+        discard_half.discarded = True          # type: ignore[attr-defined]
+    return discard_half
+
+
+def _refine_cut_edge(kernel: Kernel, cut_edge: Edge, cutter,
+                     support: TrimPlane, n_sub: int = 6) -> None:
+    """
+    Subdivide a straight MEF cut edge into a polyline that follows the TRUE
+    intersection of a curved cutter with the (planar) face it lies in.
+
+    A single chord between the two split vertices misses a curved section by
+    up to the sagitta; here each interior chord point is converged onto the
+    intersection *curve* by alternating projections — onto the cutter surface
+    (closest point) and back onto the face's support plane — then inserted
+    with :func:`euler_ops.split_edge`, so the FULL section curve is computed
+    and traversable, not just its endpoints. Each new vertex stores its
+    ``(u, v)`` on the cutter (``on_surface_uv``).
+    """
+    a = cut_edge.he1.vertex.point
+    b = cut_edge.he1.end_vertex.point
+    refined: List[Tuple[Point3D, Tuple[float, float]]] = []
+    for k in range(1, n_sub):
+        t = k / n_sub
+        p = a * (1.0 - t) + b * t
+        uv = (0.5, 0.5)
+        ok = False
+        for _ in range(30):
+            u, v, foot = surface_closest_point(cutter.surf, p, *uv, iters=25)
+            uv = (u, v)
+            dsp = support.signed_distance(foot)
+            p_new = foot - support.normal * dsp     # back onto the face plane
+            if (p_new - p).length() < 1e-10:
+                p = p_new
+                ok = True
+                break
+            p = p_new
+        if ok and abs(cutter.signed_distance(p)) < 1e-6:
+            refined.append((p, uv))
+    cur = cut_edge
+    for p, uv in refined:
+        cur, mv = eu.split_edge(kernel, cur, p)     # cur := the M..B remainder
+        mv.on_surface_uv = uv                       # type: ignore[attr-defined]
+
+
 def _trim_by_plane(kernel: Kernel, solid: Solid, plane: TrimPlane) -> TrimResult:
     """
     Topological half-space trim for **any** solid — a 2-face lamina, or a closed
@@ -622,8 +788,18 @@ def _trim_by_plane(kernel: Kernel, solid: Solid, plane: TrimPlane) -> TrimResult
         da = plane.signed_distance(a.point)
         db = plane.signed_distance(b.point)
         if (da > _TOL and db < -_TOL) or (da < -_TOL and db > _TOL):
-            t = da / (da - db)
-            m_pt = a.point * (1.0 - t) + b.point * t
+            if hasattr(plane, "intersect_segment"):
+                # Planar cutter: the linear interpolant is the exact zero.
+                t = da / (da - db)
+                m_pt = a.point * (1.0 - t) + b.point * t
+            else:
+                # Curved cutter (SurfaceCutter): the zero along the segment is
+                # not linear — bisect the signed distance on the true segment
+                # so the split vertex lands ON the cutter surface.
+                t = bezier_plane_param(Bezier([a.point, b.point]), plane)
+                if t is None:
+                    continue
+                m_pt = a.point * (1.0 - t) + b.point * t
             eu.split_edge(kernel, edge, m_pt)
 
     # Section boundary = every vertex lying on the plane (fresh splits + any
@@ -667,8 +843,13 @@ def _trim_by_plane(kernel: Kernel, solid: Solid, plane: TrimPlane) -> TrimResult
         if not (has_pos and has_neg):
             decision = _surface_interior_trim(face)
             if decision == "cut":             # curved surface straddles plane
+                # Lift the surface-plane section into the topology as a real
+                # inner ring + cap face, so the trim boundary is traversable.
+                discarded_half = _section_ring_trim(kernel, face, plane)
                 n_cut += 1
                 n_keep += 1
+                if discarded_half is not None:
+                    n_discard += 1
                 continue
             if decision == "keep":
                 n_keep += 1
@@ -711,6 +892,14 @@ def _trim_by_plane(kernel: Kernel, solid: Solid, plane: TrimPlane) -> TrimResult
         # MEF: he_m1's cycle → new_face; he_m2's cycle stays in the old face.
         _cut_edge, new_face = eu._mef(kernel, he_m1, he_m2)
         n_cut += 1
+
+        # Against a CURVED cutter the section across this face is a curve, not
+        # a chord: refine the cut edge into a polyline on the true intersection
+        # (planar faces only — a NURBS face gets its surface reparameterized).
+        if (isinstance(plane, SurfaceCutter)
+                and getattr(face, "surface", None) is None):
+            support = face_plane(face)
+            _refine_cut_edge(kernel, _cut_edge, plane, support)
 
         # Decide which resulting half is keep / discard by centroid sign.
         new_pts = [he.vertex for he in new_face.outer.halfedges()]
@@ -772,11 +961,15 @@ def face_plane(face: Face) -> TrimPlane:
 
 def _ray_contact(origin: Point3D, direction: Point3D, target):
     """
-    Forward contact point of ray ``origin + t·direction`` (t>0) with a target.
+    Forward contact of ray ``origin + t·direction`` (t>0) with a target.
 
     ``target`` is ``('plane', TrimPlane)`` or ``('surface', NURBSSurface)``.
-    Returns the contact :class:`Point3D`, or ``None`` if the ray never reaches
-    the target ahead of ``origin``.
+    Returns ``(point, uv)`` where ``uv`` is the target's surface parameter pair
+    (``None`` for a plane target), or ``None`` if the ray never reaches the
+    target ahead of ``origin``. Plane contacts are closed-form; surface contacts
+    are tessellation-seeded then Newton-refined onto the true surface
+    (:func:`geometry.ray_surface_intersect_ex`), so the point is exact — not a
+    facet approximation — and carries its parametric address for reconnection.
     """
     kind, obj = target
     if kind == "plane":
@@ -784,8 +977,12 @@ def _ray_contact(origin: Point3D, direction: Point3D, target):
         if hit is None:
             return None
         t, pt = hit
-        return pt if t > 1e-9 else None
-    return ray_surface_intersect(origin, direction, obj)
+        return (pt, None) if t > 1e-9 else None
+    hit = ray_surface_intersect_ex(origin, direction, obj)
+    if hit is None:
+        return None
+    pt, _t, u, v = hit
+    return pt, (u, v)
 
 
 def _edge_tangent_out(edge: Edge, at_end: bool) -> Point3D:
@@ -827,8 +1024,11 @@ def extend_curve(kernel: Kernel, edge: Edge, target,
         direction = _edge_tangent_out(edge, at_end)
         contact = _ray_contact(vtx.point, direction, target)
         if contact is not None:
-            new_edge, new_v = eu.mev(kernel, vtx, contact, he_ref=vtx.halfedge)
-            new_edge.curve = Bezier([vtx.point, contact])
+            point, uv = contact
+            new_edge, new_v = eu.mev(kernel, vtx, point, he_ref=vtx.halfedge)
+            new_edge.curve = Bezier([vtx.point, point])
+            if uv is not None:                 # parametric address on the target
+                new_v.on_surface_uv = uv       # type: ignore[attr-defined]
             return new_v, new_edge
     raise ValueError(
         "curve does not reach the target along its tangent "
@@ -878,7 +1078,10 @@ def extend_face(kernel: Kernel, face: Face, target,
             raise ValueError(
                 f"vertex #{he.vertex.oid} never reaches the target along the "
                 "sweep direction")
-        _e, tv = eu.mev(kernel, he.vertex, contact, he_ref=he)
+        point, uv = contact
+        _e, tv = eu.mev(kernel, he.vertex, point, he_ref=he)
+        if uv is not None:                     # parametric address on the target
+            tv.on_surface_uv = uv              # type: ignore[attr-defined]
         tops.append(tv)
 
     for i in range(n):
@@ -888,6 +1091,250 @@ def extend_face(kernel: Kernel, face: Face, target,
             raise RuntimeError("extend lost track of a swept vertex")
         eu._mef(kernel, he1, he2)
     return face
+
+
+# --------------------------------------------------------------------------- #
+# Surface-surface intersection (NURBS ∩ NURBS) and curvature-continuous blend
+# --------------------------------------------------------------------------- #
+def _resample_branch(pts: List[tuple], n: int) -> List[tuple]:
+    """Evenly subsample an SSI branch (tuples ending in a Point3D) to ≤ n."""
+    clean: List[tuple] = []
+    for item in pts:
+        if not clean or (item[-1] - clean[-1][-1]).length() > 1e-9:
+            clean.append(item)
+    if len(clean) > 1 and (clean[0][-1] - clean[-1][-1]).length() <= 1e-9:
+        clean.pop()
+    if len(clean) <= n:
+        return clean
+    step = len(clean) / n
+    return [clean[int(k * step)] for k in range(n)]
+
+
+def intersect_surfaces(kernel: Kernel, face_a: Face, face_b: Face,
+                       samples: int = 32, name: str = "intersection"):
+    """
+    NURBS ∩ NURBS: compute the intersection curve of two NURBS faces and lift
+    it into the model as a wire solid (a vertex/edge chain; closed loops are
+    MEF-closed into a lamina ribbon).
+
+    The curve comes from :func:`geometry.surface_surface_section` — surface B
+    turned into a signed-distance field over A's parameters, zero set marched
+    in A's ``(u, v)`` space, every point tightened by alternating closest-point
+    projections between both surfaces. Each wire vertex stores its parametric
+    address on *both* surfaces (``on_surface_uv`` for A, ``on_surface_uv_b``
+    for B) — the classic three-representation form of the intersection (3D
+    curve + a pcurve in each parameter space).
+
+    The full branch data is also recorded on both faces as ``face.ssi_curves``
+    for ``disp math``. Returns ``(wire_solid, closed, n_points)``.
+    """
+    surf_a = getattr(face_a, "surface", None)
+    surf_b = getattr(face_b, "surface", None)
+    if not isinstance(surf_a, NURBSSurface) or not isinstance(surf_b, NURBSSurface):
+        raise ValueError("intersect needs two faces that carry NURBS surfaces")
+    branches = surface_surface_section(surf_a, surf_b)
+    if not branches:
+        raise ValueError("the two surfaces do not intersect")
+    closed, pts = max(branches, key=lambda cp: len(cp[1]))
+    pts = _resample_branch(pts, samples)
+    if len(pts) < 2:
+        raise ValueError("intersection curve degenerated to a point")
+
+    face_a.ssi_curves = branches           # type: ignore[attr-defined]
+    face_b.ssi_curves = branches           # type: ignore[attr-defined]
+
+    ua, va, ub, vb, p0 = pts[0]
+    wire, _f, v0 = eu.mvfs(kernel, p0, name=name)
+    v0.on_surface_uv = (ua, va)            # type: ignore[attr-defined]
+    v0.on_surface_uv_b = (ub, vb)          # type: ignore[attr-defined]
+    prev = v0
+    for (ua, va, ub, vb, p) in pts[1:]:
+        edge, nv = eu.mev(kernel, prev, p, he_ref=prev.halfedge)
+        edge.curve = Bezier([prev.point, p])
+        nv.on_surface_uv = (ua, va)        # type: ignore[attr-defined]
+        nv.on_surface_uv_b = (ub, vb)      # type: ignore[attr-defined]
+        prev = nv
+    if closed:
+        closing_edge, _cap = eu.mef(kernel, prev, v0)
+        closing_edge.curve = Bezier([prev.point, v0.point])
+    return wire, closed, len(pts)
+
+
+def trim_solid_by_surface(kernel: Kernel, solid: Solid, cutter_face: Face,
+                          keep_below: bool = False) -> TrimResult:
+    """
+    Trim *solid* with a curved NURBS **surface** as the cutting tool
+    (NURBS ∩ NURBS consumed by trim).
+
+    The cutter face's surface is wrapped in a :class:`geometry.SurfaceCutter`
+    whose ``signed_distance`` (closest-point projection + normal sign) makes it
+    a drop-in replacement for :class:`TrimPlane` — the entire topological trim
+    pipeline (curve-aware edge splitting, MEF face splitting, interior section
+    rings) runs unchanged against the curved tool. ``keep above`` (default)
+    retains the side the cutter's normal points to; ``keep_below`` the other.
+    """
+    surf = getattr(cutter_face, "surface", None)
+    if not isinstance(surf, NURBSSurface):
+        raise ValueError(f"cutter face #{cutter_face.oid} carries no NURBS surface")
+    cutter = SurfaceCutter(surf, flip=keep_below)
+    return _trim_by_plane(kernel, solid, cutter)
+
+
+def _interpolate_rows(rows: List[List[Point3D]], degree: int) -> List[List[Point3D]]:
+    """
+    Solve for B-spline control rows that *interpolate* the given sample rows at
+    uniform parameters (Beer Alg. 1: assemble the basis matrix ``A`` and solve
+    ``A·c = x``). With control points equal to sample points a B-spline only
+    approximates its samples; after this solve the assembled patch reproduces
+    every sample row exactly, so each cross-section IS its quintic Hermite span.
+    """
+    m = len(rows)
+    if m <= degree + 1:
+        return rows                            # Bezier row count: leave as-is
+    import numpy as np
+    from .geometry import _bspline_basis
+    knots = NURBSSurface._clamped_knots(m, degree)
+    a_mat = np.zeros((m, m))
+    for r in range(m):
+        t = min(r / (m - 1), 1.0 - 1e-9)
+        for i in range(m):
+            a_mat[r, i] = _bspline_basis(i, degree, t, knots)
+    n_cols = len(rows[0])
+    rhs = np.zeros((m, 3 * n_cols))
+    for r, row in enumerate(rows):
+        for j, p in enumerate(row):
+            rhs[r, 3 * j:3 * j + 3] = (p.x, p.y, p.z)
+    sol = np.linalg.solve(a_mat, rhs)
+    return [[Point3D(*sol[i, 3 * j:3 * j + 3]) for j in range(n_cols)]
+            for i in range(m)]
+
+
+def _blend_row(surf: NURBSSurface, u: float, v: float, into: Point3D,
+               other_end: Point3D, chord: float):
+    """
+    Hermite end data for one blend row on one surface: rail point, first and
+    second derivatives (w.r.t. the blend parameter) of the cross-boundary walk.
+    """
+    d1, d2, _du, _dv = surface_directional_derivs(surf, u, v, into)
+    return d1 * chord, d2 * (chord * chord)
+
+
+def blend_surfaces(kernel: Kernel, face_a: Face, face_b: Face,
+                   width: float, samples: int = 9,
+                   name: str = "blend") -> Solid:
+    """
+    Build a **curvature-continuous (G2) blend patch** across the intersection
+    of two NURBS faces.
+
+    Construction (per sample along the NURBS ∩ NURBS curve):
+
+    1. The intersection curve is computed with
+       :func:`geometry.surface_surface_section` and resampled.
+    2. On each surface, a *rail* point is offset from the intersection by
+       ``width`` along the in-surface direction perpendicular to the curve
+       (normal × tangent, oriented away from the other surface, kept
+       orientation-consistent along the curve).
+    3. At each rail the cross-boundary walk toward the intersection is
+       differentiated on the true surface (first + second directional
+       derivatives, :func:`geometry.surface_directional_derivs`).
+    4. A **quintic Hermite** span matches position, first and second derivative
+       at both rails — curvature continuity with each host surface along the
+       cross direction — and is written as a degree-5 Bezier row:
+       ``P0=a, P1=a+a'/5, P2=a+2a'/5+a''/20, P3=b−2b'/5+b''/20, P4=b−b'/5, P5=b``.
+    5. The rows assemble into a NURBS patch (degree 5 across × ≤3 along),
+       attached to a new lamina solid exactly like ``create nurbs``.
+
+    Returns the new blend solid.
+    """
+    surf_a = getattr(face_a, "surface", None)
+    surf_b = getattr(face_b, "surface", None)
+    if not isinstance(surf_a, NURBSSurface) or not isinstance(surf_b, NURBSSurface):
+        raise ValueError("blend needs two faces that carry NURBS surfaces")
+    if width <= 0:
+        raise ValueError("blend width must be positive")
+
+    branches = surface_surface_section(surf_a, surf_b)
+    if not branches:
+        raise ValueError("the two surfaces do not intersect - nothing to blend")
+    closed, pts = max(branches, key=lambda cp: len(cp[1]))
+    pts = _resample_branch(pts, samples)
+    if closed:
+        pts = pts + [pts[0]]               # wrap the strip around a closed curve
+    m = len(pts)
+    if m < 2:
+        raise ValueError("intersection curve degenerated to a point")
+
+    cutter_b = SurfaceCutter(surf_b)
+    cutter_a = SurfaceCutter(surf_a)
+
+    rows: List[List[Point3D]] = []
+    prev_da: Optional[Point3D] = None
+    prev_db: Optional[Point3D] = None
+    for k in range(m):
+        ua, va, ub, vb, p = pts[k]
+        # Tangent of the intersection curve (central difference, wrap-aware).
+        p_next = pts[(k + 1) % m if closed else min(k + 1, m - 1)][4]
+        p_prev = pts[(k - 1) % m if closed else max(k - 1, 0)][4]
+        t = (p_next - p_prev)
+        t = t.normalized() if t.length() > 1e-12 else Point3D(1, 0, 0)
+
+        # In-surface offset directions, perpendicular to the curve.
+        da = surface_normal(surf_a, ua, va).cross(t)
+        db = surface_normal(surf_b, ub, vb).cross(t)
+        da = da.normalized() if da.length() > 1e-12 else Point3D(1, 0, 0)
+        db = db.normalized() if db.length() > 1e-12 else Point3D(-1, 0, 0)
+        if prev_da is not None:            # keep orientation consistent
+            if da.dot(prev_da) < 0:
+                da = da * -1.0
+            if db.dot(prev_db) < 0:
+                db = db * -1.0
+        else:                              # first sample: offset away from the
+            eps = 0.2 * width              # other surface, and to opposite sides
+            if abs(cutter_b.signed_distance(p + da * eps)) < \
+               abs(cutter_b.signed_distance(p - da * eps)):
+                da = da * -1.0
+            if abs(cutter_a.signed_distance(p + db * eps)) < \
+               abs(cutter_a.signed_distance(p - db * eps)):
+                db = db * -1.0
+        prev_da, prev_db = da, db
+
+        # Rails: walk `width` along the surface (first-order parameter step).
+        _d1a, _d2a, du_a, dv_a = surface_directional_derivs(surf_a, ua, va, da)
+        _d1b, _d2b, du_b, dv_b = surface_directional_derivs(surf_b, ub, vb, db)
+        ra_u = min(max(ua + du_a * width, 0.0), 1.0)
+        ra_v = min(max(va + dv_a * width, 0.0), 1.0)
+        rb_u = min(max(ub + du_b * width, 0.0), 1.0)
+        rb_v = min(max(vb + dv_b * width, 0.0), 1.0)
+        a_pt = surf_a.evaluate(ra_u, ra_v)
+        b_pt = surf_b.evaluate(rb_u, rb_v)
+        chord = (b_pt - a_pt).length() or 1e-9
+
+        # Hermite data: walk INTO the blend from each rail (toward the curve).
+        a1, a2 = _blend_row(surf_a, ra_u, ra_v, da * -1.0, b_pt, chord)
+        b1, b2 = _blend_row(surf_b, rb_u, rb_v, db * -1.0, a_pt, chord)
+        # C(0)=a, C'(0)=a1, C''(0)=a2 ; C(1)=b, C'(1)=-b1, C''(1)=+b2
+        rows.append([
+            a_pt,
+            a_pt + a1 * (1.0 / 5.0),
+            a_pt + a1 * (2.0 / 5.0) + a2 * (1.0 / 20.0),
+            b_pt + b1 * (2.0 / 5.0) + b2 * (1.0 / 20.0),
+            b_pt + b1 * (1.0 / 5.0),
+            b_pt,
+        ])
+
+    degree_u = min(3, m - 1)
+    patch = NURBSSurface(_interpolate_rows(rows, degree_u), degree_u, 5)
+
+    # Carry the patch on a lamina solid, exactly like create_nurbs_dome.
+    c00, c05 = rows[0][0], rows[0][5]
+    c10, c15 = rows[-1][0], rows[-1][5]
+    solid, _base, v0 = eu.mvfs(kernel, c00, name=name)
+    _e, v1 = eu.mev(kernel, v0, c10)
+    _e, v2 = eu.mev(kernel, v1, c15)
+    _e, v3 = eu.mev(kernel, v2, c05)
+    _edge, front = eu.mef(kernel, v3, v0)
+    front.surface = patch
+    return solid
 
 
 def _trim_metadata_by_plane(kernel: Kernel, solid: Solid, plane: TrimPlane) -> TrimResult:
@@ -919,12 +1366,13 @@ def _trim_metadata_by_plane(kernel: Kernel, solid: Solid, plane: TrimPlane) -> T
         n_cut += 1
         section: List[Point3D] = []
         n_v = len(verts)
-        for i in range(n_v):
-            p0 = verts[i].point
-            p1 = verts[(i + 1) % n_v].point
-            result = plane.intersect_segment(p0, p1)
-            if result is not None:
-                section.append(result[1])
+        if hasattr(plane, "intersect_segment"):   # curved cutters have no closed form
+            for i in range(n_v):
+                p0 = verts[i].point
+                p1 = verts[(i + 1) % n_v].point
+                result = plane.intersect_segment(p0, p1)
+                if result is not None:
+                    section.append(result[1])
         face.trim_plane = plane        # type: ignore[attr-defined]
         face.trim_section = section    # type: ignore[attr-defined]
 

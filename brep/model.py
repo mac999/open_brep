@@ -60,6 +60,22 @@ class Kernel:
         caller's responsibility)."""
         self.registry.unregister(entity.oid)
 
+    def delete_solid(self, solid: Solid) -> None:
+        """Remove a whole solid and every entity it owns from the model."""
+        for face in list(solid.faces):
+            for loop in list(face.loops):
+                for he in loop.halfedges():
+                    self.destroy(he)
+                self.destroy(loop)
+            self.destroy(face)
+        for edge in list(solid.edges):
+            self.destroy(edge)
+        for v in list(solid.vertices):
+            self.destroy(v)
+        self.destroy(solid)
+        if solid in self.solids:
+            self.solids.remove(solid)
+
     # --- lookup ----------------------------------------------------------- #
     def get(self, oid: int):
         return self.registry.get(oid)

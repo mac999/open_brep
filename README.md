@@ -6,15 +6,7 @@ Representation (B-Rep) kernel on a pure half-edge data structure, manipulated on
 through atomic **Euler operators**, with a clean MVC separation between topology,
 geometry, high-level modeling and the CLI.
 
-<p align="center">
-<img src="./doc/img2.png" height="150"></img>
-<img src="./doc/img1.png" height="150"></img> </br>
-<img src="./doc/img3.png" height="125"></img>
-<img src="./doc/img4.png" height="125"></img> </br>
-<img src="./doc/img5.png" height="120"></img>
-<img src="./doc/img6.png" height="120"></img>
-<img src="./doc/img7.png" height="120"></img>
-</p>
+> Implements the design in [`PRD.md`](PRD.md).
 
 ## Why this exists
 
@@ -34,8 +26,8 @@ and the validator checks it (plus half-edge pointer consistency) on demand.
 brep/
   geometry.py    Layer 2  Point3D, Bezier, NURBSSurface, TrimPlane, curve/surface intersection, affine transforms (numpy)
   topology.py    Layer 1  Half-edge entities: Vertex / HalfEdge / Edge / Loop / Face / Solid
-  euler_ops.py   Layer 1  Micro Euler operators (mvfs, mev, mef, kef, kemr/mekr, kfmr/mfkr, split_edge)
-  macro.py       Layer 3  Macro modeling: extrude, revolve, trim, extend, box/sphere/cylinder/nurbs/plane
+  euler_ops.py   Layer 1  Micro Euler operators (mvfs/kvfs-, mev/kev, mef/kef, kemr/mekr, kfmr/mfkr, split_edge)
+  macro.py       Layer 3  Macro modeling: extrude, revolve, trim (plane/surface), extend, intersect, blend, primitives
   mesh.py        Layer 3  Build a valid half-edge solid from a polygon mesh (sphere/cylinder)
   registry.py    Layer 4  Centralized immutable #id symbol table
   model.py                Kernel: owns the registry + all solids (the "Model")
@@ -154,6 +146,17 @@ For example: `help plane`, `help box`, `help trim`, `help create`.
 | `micro mvfs <x> <y> <z> [as #id]`            | Make Vertex Face Solid – seed a solid         |
 | `micro mev #<vertex> <x> <y> <z> [as #edge]` | Make Edge Vertex – grow a wire                |
 | `micro mef #<v1> #<v2> [as #face]`           | Make Edge Face – close a loop into a new face |
+| `micro kev #<edge>`                          | Kill Edge Vertex – remove a spike + its tip (inverse of mev) |
+| `micro kef #<edge>`                          | Kill Edge Face – merge the two faces across an edge (inverse of mef) |
+| `micro semv #<edge> <x> <y> <z>`             | Split Edge Make Vertex – insert a vertex on an edge |
+| `micro kemr #<edge>`                         | Kill Edge Make Ring – detach a cycle into an inner ring |
+| `micro mekr #<v_outer> #<v_ring>`            | Make Edge Kill Ring – bridge a ring back to the outer loop |
+| `micro kfmr #<face>`                         | Kill Face Make Ring – open a handle (genus+1) |
+| `micro mfkr #<loop>`                         | Make Face Kill Ring – close a handle (genus−1) |
+
+The full Mäntylä operator set is exposed, each op reporting its ΔEuler; the
+make/kill pairs are exact inverses, so any construction can be undone step by
+step (`help micro`).
 
 ### Macro modeling
 
@@ -173,8 +176,12 @@ parameter details and examples.
 | `trim surface #<face> keep <u0> <u1> <v0> <v1>`                | face, uv window          | —                           | crop a NURBS face to the kept parametric window                                                                                                                                                     |
 | `trim surface #<face> by #<loop>`                              | face, loop id            | —                           | legacy: tag a trim-boundary id (metadata only, no geometry change)                                                                                                                                  |
 | `trim #<solid> by plane <nx> <ny> <nz> <d>`                    | solid, plane eq          | `[keep above\|below]`       | geometry-aware half-space cut of any solid (lamina/box/sphere/cylinder/nurbs); cuts edges on their real curve and faces on their real surface;`keep` picks the surviving side (default `above`) |
+| `trim #<solid> by surface #<face>`                             | solid, cutter face       | `[keep above\|below]`       | trim with a **curved NURBS cutter** (NURBS ∩ NURBS): the cutter surface acts as a signed-distance field; crossing edges bisected onto the curved tool, straddling faces MEF-cut; `above` = the cutter-normal side |
 | `extend #<edge> to plane <nx> <ny> <nz> <d>` \| `to #<face>` | edge, target             | —                           | extend a curve along its tangent until it meets the target (plane / face-plane / NURBS surface); appends a vertex+edge on the contact point                                                         |
 | `extend #<face> to plane <nx> <ny> <nz> <d>` \| `to #<face>` | face, target             | `[along <dx> <dy> <dz>]`   | sweep a planar sheet up to the target (extrude-to-target); the new cap lies on the target — flat for a plane, conforming for a NURBS surface                                                       |
+| `intersect #<faceA> #<faceB>`                                  | two NURBS faces          | `[samples <n>]` `[as]`     | **NURBS ∩ NURBS** intersection curve lifted into the model as a wire solid; every vertex stores `(u,v)` on *both* surfaces (the classic three-representation form)                                  |
+| `blend #<faceA> #<faceB> width <w>`                            | two NURBS faces, width   | `[samples <n>]` `[as]`     | **curvature-continuous (G2) blend patch** across the intersection: quintic Hermite cross-sections matching position + 1st + 2nd derivative on both rails                                            |
+| `delete #<solid>`                                              | solid                    | —                           | remove a solid and everything it owns (aliases into it are unbound)                                                                                                                                  |
 
 ### Geometry & editing
 
@@ -310,9 +317,16 @@ save "scripts/trim_out/06_nurbs_vertical_after.step" @nv   // OPEN_SHELL + B_SPL
 **3 — Geometry-aware curved cut, only the surface crosses** (NURBS cap cut).
 The dome is a flat lamina (every corner vertex at z=0) carrying a surface that
 rises to z≈4. A horizontal plane crosses **no topological edge**, so a
-polygon-only trim would miss it entirely. The trim samples the *surface* signed
-distance, keeps the curved cap, and exports it as a **faceted `OPEN_SHELL`** that
-follows the true surface–plane intersection:
+polygon-only trim would miss it entirely. The trim extracts the section curve in
+the surface's own `(u,v)` parameter space (marching squares over the signed
+distance, each point bisection-refined onto the true surface), then **lifts it
+into the topology**: a bridge MEV + MEV chain + MEF + KEMR sequence inserts the
+section as a real loop of vertices/edges — a new *cap face* bounded by it and an
+*inner ring* on the remaining half — so the trim boundary is traversable through
+the half-edge structure and the Euler invariant still holds
+(`V − E + F − R = 2`). Every section vertex stores its surface parameters in
+`vertex.on_surface_uv`. The discard half is flagged; the keep half exports as a
+faceted `OPEN_SHELL` following the section:
 
 ```
 create nurbs 20 8 as @cap
@@ -340,13 +354,18 @@ then pass the same Euler/pointer validation as the Euler-operator shapes.
 ### Extend examples (`scripts/extend_examples.bcmd`)
 
 `extend` grows a **source** entity until it reaches a **target**, reusing the
-same intersection math as trim (line–plane closed form, ray–surface over the
-tessellation). Both geometry (a new point *on* the target) and topology (a new
-vertex/edge, or a swept strip of faces) are updated. Source and target must be
-arranged so the extension path actually **crosses** the target (a right angle or
-an oblique angle); a parallel target is never reached, or gives only a trivial
-offset. Four source→target combinations are demonstrated; each saves a
-before/after pair into `scripts/extend_out/`:
+same shared intersection layer as trim: line–plane contacts are closed-form,
+and surface contacts are **numerically refined** — a tessellation hit seeds a
+Newton-style iteration (closest-point projection using the surface tangent
+vectors ∂S/∂u, ∂S/∂v, per Beer's Algorithms 2–3) so the contact lies on the
+*true* surface, not on a facet, and carries its parametric address
+(`vertex.on_surface_uv = (u, v)`; shown by `disp math #<vertex>`). Both geometry
+(the new point *on* the target) and topology (a new vertex/edge, or a swept
+strip of faces) are updated. Source and target must be arranged so the extension
+path actually **crosses** the target (a right angle or an oblique angle); a
+parallel target is never reached, or gives only a trivial offset. Four
+source→target combinations are demonstrated; each saves a before/after pair into
+`scripts/extend_out/`:
 
 ```powershell
 python main.py -q scripts/extend_examples.bcmd
@@ -395,6 +414,70 @@ extend $face to @df
 invariant is preserved and `check validity` passes after every extend. Type
 `help extend` in the REPL for the full reference.
 
+### NURBS ∩ NURBS, curved-cutter trim, G2 blend (`scripts/ssi_blend_examples.bcmd`)
+
+```powershell
+python main.py -q scripts/ssi_blend_examples.bcmd
+```
+
+All three build on one setup: dome A (apex z=4) and a second dome rotated
+180° about x into a **bowl** and lifted to z=5, so the two surfaces cross in a
+closed loop (`move`/`rotate` transform the NURBS control nets together with the
+vertices, so geometry and topology stay in sync):
+
+```
+create nurbs 20 8 as @a
+set @fa $face
+create nurbs 20 8 as @b
+set @fb $face
+rotate @b x 180
+move @b 0 0 5
+```
+
+**`intersect @fa @fb as @c`** — surface B becomes a signed-distance field over
+A's `(u,v)` grid (closest-point projection + normal sign); the zero set is
+marched in A's parameter space, bisection-refined on the true surface, and each
+point tightened onto the exact intersection by **alternating projections**
+between both surfaces (residuals ~1e-13 on *both*). The curve is lifted into
+the model as a wire solid in the classic **three representations**: the 3D
+polyline itself, `(u,v)` on A (`vertex.on_surface_uv`) and `(u,v)` on B
+(`vertex.on_surface_uv_b`), all visible via `disp math`.
+
+**`trim @bx by surface @fa keep below`** — the dome surface itself is the
+cutting tool (a `SurfaceCutter` duck-typed like `TrimPlane`), so the *entire*
+plane-trim pipeline runs unchanged against a curved cutter: crossing box edges
+are **bisected onto the curved surface** (split vertices land on it to ~1e-10),
+straddling faces MEF-cut, and each cut edge is **refined into a section
+polyline** that follows the true curved intersection (alternating projections
+between the cutter surface and the face plane; sagitta ~0.01 vs ~0.32 for a
+single chord). Two NURBS laminas whose overlap contains the whole closed
+intersection loop (`trim @a2 by surface @fb2`) get the loop lifted in as a cap
+face + inner ring. Place the shapes so the crossing region is **fully covered
+by both** — a partially overlapping target clips the intersection curve and
+leaves the trim incomplete. `keep above` means the cutter-normal side.
+
+**`blend @fa @fb width 1.5 as @bl`** — a **curvature-continuous (G2) blend
+patch** across the intersection: rails are offset `width` from the curve on
+each surface (in-surface, perpendicular to the curve), the cross-boundary walk
+is differentiated on the true surface (1st + 2nd directional derivatives), and
+each cross-section is a **quintic Hermite** span matching position, first *and*
+second derivative at both rails. Control rows are then solved so the patch
+**interpolates** every sampled section (basis-matrix solve — the fit step of
+the standard NURBS toolkit), and the strip is attached to a lamina solid,
+viewable and STEP-exportable like any other NURBS face.
+
+### Analytic trimmed B-splines in STEP (pcurves)
+
+A trimmed NURBS face now exports **analytically by default**: one
+`ADVANCED_FACE` carrying the full `B_SPLINE_SURFACE_WITH_KNOTS`, bounded by its
+topological loops, where every boundary edge is a `SURFACE_CURVE` pairing the
+3D chord with a **`PCURVE`** — a degree-1 B-spline in the surface's `(u,v)`
+parameter space inside a `DEFINITIONAL_REPRESENTATION` (ISO 10303-42). This is
+the standard pcurve representation of a trimmed surface, made possible because
+the trim stores every section vertex's `(u,v)` in the topology. For viewers
+with weak pcurve support, `save "<file>" [#solid] faceted` emits the kept side
+as a triangle shell instead.
+
 ## Verified results
 
 `tests/test_kernel.py` builds boxes, triangular and pentagonal prisms (via both
@@ -402,9 +485,21 @@ the macro pipeline and raw Euler operators), a UV sphere, a cylinder and a NURBS
 dome, exercises Bezier evaluation/splitting and KEF (the inverse of MEF), and
 asserts `V - E + F - R = 2` with no dangling pointers on every shape. The trim
 suite covers a lamina plane cut, `keep above`/`keep below`, a NURBS surface-region
-crop, the **NURBS cap cut** (surface crosses the plane while the flat boundary
-does not — the kept cap tessellates entirely above the plane), and a **curved
-edge cut** (a Bezier edge is split *on the curve* at z=3, never on its chord).
+crop, the **NURBS cap cut** (the section becomes a real topological ring: 24
+vertices/edges traversable through the half-edge structure, each vertex on the
+plane *and* on the surface at its stored `(u,v)`), and a **curved edge cut** (a
+Bezier edge is split *on the curve* at z=3, never on its chord). The numerical
+intersection layer is tested directly: closest-point projection lands exactly on
+the dome apex, ray–surface contacts sit on the true surface to <1e-9 (facet-only
+accuracy was ~3e-3), and the plane section extracts as one closed parametric
+loop. The extend suite verifies contacts on plane and surface targets, the
+stored `(u,v)` parameters, and the swept conforming cap. The NURBS ∩ NURBS
+suite checks the SSI wire against *both* surfaces (residuals ~1e-13), the
+curved-cutter trim (split vertices on the cutter to ~1e-10), the G2 blend
+(rails interpolated at every station, cross-tangent in the host tangent
+plane), the analytic pcurve STEP export (one trimmed `ADVANCED_FACE`, 24
+`PCURVE`s, faceted fallback), KEV as the exact inverse of MEV, and that
+`move`/`rotate` transform the NURBS control nets together with the topology.
 
 ## Scope & limitations
 
@@ -416,23 +511,35 @@ This is a teaching kernel, deliberately small:
 * **`trim curve`** inserts the split vertex with `split_edge` (both adjacent
   loops updated coherently, no spike) and subdivides the attached Bezier by
   De Casteljau so each half carries its own sub-curve.
-* **`trim #<solid> by plane`** performs a *geometry-aware topological trim* for
-  **all** solids (lamina, box, sphere, cylinder, NURBS dome): crossing edges are
-  split on their real curve, straddling faces MEF-cut, discard faces dropped from
-  a STEP `OPEN_SHELL`, and the Euler invariant is preserved throughout. Two
-  teaching-scope boundaries remain: (a) an *interior / cap* curved cut — where the
-  surface crosses but the flat boundary does not — is kept as a **faceted**
-  keep-side shell (a 16×16 tessellation of the true surface–plane intersection),
-  not an analytic trimmed B-spline with pcurves, and (b) no cap face is synthesised
-  to re-close the cut (the result is an open shell by design). Parametric
-  `face.trim_plane` metadata is used only when the plane misses the solid entirely.
-* **Surface–surface intersection** (NURBS ∩ NURBS, per the iterative marching
-  algorithms in the literature) is not implemented — only plane cutters are.
+* **`trim #<solid> by plane|surface`** performs a *geometry-aware topological
+  trim* for **all** solids against a plane **or a curved NURBS cutter**:
+  crossing edges are split on their real curve (bisected onto a curved tool),
+  straddling faces MEF-cut, and an *interior / cap* cut lifts the section curve
+  into the topology as a cap face + inner ring (bridge MEV → MEV chain → MEF →
+  KEMR), so the trim boundary is always traversable and the Euler invariant
+  holds. Trimmed NURBS faces export analytically with **pcurves** (or faceted
+  on request). Remaining teaching-scope boundaries: (a) the section loop is a
+  polyline approximation of the exact intersection (each point Newton/bisection
+  refined onto the true surface; pcurves are degree-1 spans between them),
+  (b) no face is synthesised to re-close the cut (the result is an open shell
+  by design), and (c) full Boolean operations (union/difference) are not
+  implemented — trim-by-surface is the half-space building block.
+* **`intersect` (NURBS ∩ NURBS)** marches surface B's signed-distance field
+  over A's parameters and tightens each point by alternating projections; the
+  curve is delivered in 3D plus both parameter spaces. **`blend`** builds a
+  quintic-Hermite G2 strip across that intersection (position + 1st + 2nd
+  derivative matched at both rails at every sampled section). Boundaries: the
+  blend matches derivatives *at the sampled stations* (degree-3 interpolation
+  between them), a closed intersection gets a C0 seam where the strip wraps,
+  and the host surfaces are not trimmed back to the blend rails (a full fillet
+  operation is out of scope).
 * **`extend`** grows a curve (tangent ray → contact) or a planar sheet
   (extrude-to-target) onto a plane or NURBS surface, appending topology on the
-  computed intersection. The curve extension is a straight tangent continuation
-  (C1), not a re-fit Bezier, and a sheet extended onto a curved surface gets a
-  faceted conforming cap (its vertices on the surface), not a re-fit NURBS patch.
+  computed intersection; surface contacts are Newton-refined onto the true
+  surface and store `(u,v)`. The curve extension is a straight tangent
+  continuation (C1), not a re-fit Bezier, and a sheet extended onto a curved
+  surface gets a faceted conforming cap (its vertices on the surface), not a
+  re-fit NURBS patch.
 * **`revolve`** produces a faceted, valid solid with cylindrical-patch tags rather
   than an analytic surface of revolution.
 * **STEP import** rebuilds a vertex/point cloud, not the full half-edge graph

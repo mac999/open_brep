@@ -18,7 +18,7 @@ import re
 from typing import Dict, List
 
 from .geometry import (NURBSSurface, Point3D, TrimPlane,
-                       tessellate_surface_trim)
+                       surface_closest_point, tessellate_surface_trim)
 from .model import Kernel
 from .topology import Solid
 
@@ -126,12 +126,98 @@ def _emit_triangle_face(w: "_StepWriter", a: Point3D, b: Point3D, c: Point3D) ->
 
 
 def _is_trimmed_nurbs(f) -> bool:
+    # Any cutter with a signed_distance (TrimPlane or SurfaceCutter) counts.
     return (isinstance(getattr(f, "surface", None), NURBSSurface)
-            and isinstance(getattr(f, "trim_plane", None), TrimPlane))
+            and hasattr(getattr(f, "trim_plane", None), "signed_distance"))
 
 
-def save(solid: Solid, filepath: str) -> None:
-    """Write ``solid`` to ``filepath`` as a STEP AP203 manifold solid B-rep."""
+def _vertex_uv(v, surf: NURBSSurface):
+    """Surface parameters of a boundary vertex: stored, or projected on demand."""
+    uv = getattr(v, "on_surface_uv", None)
+    if uv is not None:
+        return uv
+    u, vv, _foot = surface_closest_point(surf, v.point)
+    return (u, vv)
+
+
+def _emit_trimmed_bspline_face(w: "_StepWriter", f) -> int:
+    """
+    Emit a trimmed NURBS face **analytically**: the full
+    ``B_SPLINE_SURFACE_WITH_KNOTS`` bounded by its topological loops, each edge
+    carried by a ``SURFACE_CURVE`` that pairs the 3D chord with a **PCURVE** —
+    a degree-1 B-spline in the surface's ``(u, v)`` parameter space inside a
+    ``DEFINITIONAL_REPRESENTATION`` (ISO 10303-42). This is the classic
+    pcurve-based trimmed-surface representation: viewers that honour bounds
+    render the exact trimmed patch, and the parametric geometry round-trips.
+    """
+    surf = f.surface
+    surf_id = _emit_bspline_surface(w, surf)
+    pctx = w.add("PARAMETRIC_REPRESENTATION_CONTEXT('2D parameter space','')")
+
+    vertex_pt: dict = {}       # vertex oid -> (CARTESIAN_POINT id, VERTEX_POINT id)
+    edge_curve: dict = {}      # edge oid -> EDGE_CURVE id
+
+    def _vp(v):
+        if v.oid not in vertex_pt:
+            p = v.point
+            cp = w.add(f"CARTESIAN_POINT('',({p.x:.6f},{p.y:.6f},{p.z:.6f}))")
+            vertex_pt[v.oid] = (cp, w.add(f"VERTEX_POINT('',#{cp})"))
+        return vertex_pt[v.oid]
+
+    bound_ids = []
+    for li, loop in enumerate(f.loops):
+        oriented = []
+        for he in loop.halfedges():
+            if he.edge is None:
+                continue
+            e = he.edge
+            if e.oid not in edge_curve:
+                va = e.he1.vertex
+                vb = e.he1.end_vertex
+                cp_a, vp_a = _vp(va)
+                _cp_b, vp_b = _vp(vb)
+                d = vb.point - va.point
+                length = d.length() or 1.0
+                dirn = d * (1.0 / length)
+                di = w.add(f"DIRECTION('',({dirn.x:.6f},{dirn.y:.6f},{dirn.z:.6f}))")
+                ve = w.add(f"VECTOR('',#{di},{length:.6f})")
+                c3 = w.add(f"LINE('',#{cp_a},#{ve})")
+                ua, vva = _vertex_uv(va, surf)
+                ub, vvb = _vertex_uv(vb, surf)
+                q1 = w.add(f"CARTESIAN_POINT('',({ua:.9f},{vva:.9f}))")
+                q2 = w.add(f"CARTESIAN_POINT('',({ub:.9f},{vvb:.9f}))")
+                c2 = w.add(
+                    f"B_SPLINE_CURVE_WITH_KNOTS('',1,(#{q1},#{q2}),"
+                    f".UNSPECIFIED.,.F.,.F.,(2,2),(0.000000,1.000000),"
+                    f".UNSPECIFIED.)")
+                dr = w.add(f"DEFINITIONAL_REPRESENTATION('',(#{c2}),#{pctx})")
+                pc = w.add(f"PCURVE('',#{surf_id},#{dr})")
+                sc = w.add(f"SURFACE_CURVE('',#{c3},(#{pc}),.PCURVE_S1.)")
+                edge_curve[e.oid] = w.add(
+                    f"EDGE_CURVE('',#{vp_a},#{vp_b},#{sc},.T.)")
+            same_dir = he.edge.he1 is he
+            oriented.append(w.add(
+                f"ORIENTED_EDGE('',*,*,#{edge_curve[e.oid]},"
+                f"{'.T.' if same_dir else '.F.'})"))
+        refs = ",".join(f"#{o}" for o in oriented)
+        el = w.add(f"EDGE_LOOP('',({refs}))")
+        kind = "FACE_OUTER_BOUND" if li == 0 else "FACE_BOUND"
+        bound_ids.append(w.add(f"{kind}('',#{el},.T.)"))
+
+    bounds = ",".join(f"#{b}" for b in bound_ids)
+    return w.add(f"ADVANCED_FACE('',({bounds}),#{surf_id},.T.)")
+
+
+def save(solid: Solid, filepath: str, faceted: bool = False) -> None:
+    """
+    Write ``solid`` to ``filepath`` as a STEP AP203 B-rep.
+
+    Trimmed NURBS faces export **analytically** by default — the full B-spline
+    surface bounded by its topological loops with PCURVEs in parameter space
+    (see :func:`_emit_trimmed_bspline_face`). Pass ``faceted=True`` to emit the
+    kept side as a triangle shell instead (for viewers with weak pcurve
+    support).
+    """
     parent = os.path.dirname(filepath)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -186,14 +272,18 @@ def save(solid: Solid, filepath: str) -> None:
     # Faces: ADVANCED_FACE with FACE_OUTER_BOUND/FACE_BOUND edge loops on a PLANE.
     face_ids: List[int] = []
     for f in surviving:
-        # A curved face carrying an interior/cap trim plane cannot be expressed
-        # as a single analytic B-spline patch; emit its kept +side as a faceted
-        # triangle shell that follows the true surface–plane intersection.
+        # A curved face carrying a trim cutter exports analytically: the full
+        # B-spline surface bounded by its topological loops with PCURVEs in
+        # (u,v) space. 'faceted=True' falls back to a keep-side triangle shell.
         if _is_trimmed_nurbs(f):
-            pts_m, tris_m = tessellate_surface_trim(f.surface, f.trim_plane, 16, 16)
-            for (ta, tb, tc) in tris_m:
-                face_ids.append(
-                    _emit_triangle_face(w, pts_m[ta], pts_m[tb], pts_m[tc]))
+            if faceted:
+                pts_m, tris_m = tessellate_surface_trim(
+                    f.surface, f.trim_plane, 16, 16)
+                for (ta, tb, tc) in tris_m:
+                    face_ids.append(
+                        _emit_triangle_face(w, pts_m[ta], pts_m[tb], pts_m[tc]))
+            else:
+                face_ids.append(_emit_trimmed_bspline_face(w, f))
             continue
 
         bound_ids: List[int] = []

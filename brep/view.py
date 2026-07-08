@@ -62,7 +62,14 @@ def format_math(entity) -> str:
     """Print the underlying geometric equation / control data of an entity."""
     if isinstance(entity, Vertex):
         p = entity.point or Point3D(0, 0, 0)
-        return f"Vertex #{entity.oid}: point = {p}"
+        uv = getattr(entity, "on_surface_uv", None)
+        uv_b = getattr(entity, "on_surface_uv_b", None)
+        tail = (f"\n    on surface A at (u,v) = ({uv[0]:.6g}, {uv[1]:.6g})"
+                if uv is not None else "")
+        if uv_b is not None:
+            tail += (f"\n    on surface B at (u,v) = "
+                     f"({uv_b[0]:.6g}, {uv_b[1]:.6g})")
+        return f"Vertex #{entity.oid}: point = {p}{tail}"
 
     if isinstance(entity, Edge):
         head = f"Edge #{entity.oid}"
@@ -120,6 +127,16 @@ def format_math(entity) -> str:
         tb = getattr(entity, "trim_boundary", None)
         if tb is not None:
             lines.append(f"  trim boundary id: #{tb}")
+
+        # NURBS/NURBS intersection branches recorded by 'intersect'
+        ssi = getattr(entity, "ssi_curves", None)
+        if ssi:
+            for bi, (closed, pts) in enumerate(ssi):
+                kind = "closed loop" if closed else "open curve"
+                lines.append(
+                    f"  surface-surface intersection branch {bi}: "
+                    f"{kind}, {len(pts)} pts "
+                    f"(3D + (u,v) on both surfaces)")
 
         return "\n".join(lines)
 

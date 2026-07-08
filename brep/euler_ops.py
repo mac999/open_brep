@@ -258,6 +258,61 @@ def _loops_around(vertex: Vertex):
 
 
 # --------------------------------------------------------------------------- #
+# KEV - Kill Edge Vertex (inverse of MEV)
+# --------------------------------------------------------------------------- #
+def kev(kernel: Kernel, edge: Edge) -> None:
+    """
+    Remove a *spike* edge and its tip vertex (the inverse of :func:`mev`).
+
+    The edge must be a dangling spike: one of its half-edges is immediately
+    followed by the other in the loop (the walk turns around at the tip). The
+    tip vertex — the one whose only incident edge is this spike — is destroyed
+    together with the edge (ΔEuler: −1V −1E).
+
+    A one-edge wire (the result of MVFS + a single MEV) degenerates back to the
+    MVFS seed state: a single edge-less half-edge cycle around the base vertex.
+    """
+    ha, hb = edge.he1, edge.he2
+    # Identify the tip: the half-edge pair turns around there (out.next is back).
+    if ha.next is hb:            # ha: base->tip, hb: tip->base
+        out_he, back_he = ha, hb
+    elif hb.next is ha:
+        out_he, back_he = hb, ha
+    else:
+        raise ValueError(
+            "KEV expects a spike edge (its tip vertex must have no other edge)")
+    tip = back_he.vertex
+    base = out_he.vertex
+    loop = out_he.loop
+    solid = kernel.solid_of(loop)
+
+    if back_he.next is out_he:
+        # One-edge wire: restore the MVFS seed (single edge-less half-edge).
+        out_he.edge = None
+        out_he.next = out_he.prev = out_he
+        loop.halfedge = out_he
+        base.halfedge = out_he
+        solid.remove_edge(edge)
+        solid.remove_vertex(tip)
+        for dead in (back_he, edge, tip):
+            kernel.destroy(dead)
+        return
+
+    prev = out_he.prev
+    nxt = back_he.next
+    prev.next = nxt
+    nxt.prev = prev
+    if loop.halfedge in (out_he, back_he):
+        loop.halfedge = nxt
+    if base.halfedge is out_he:
+        base.halfedge = nxt
+    solid.remove_edge(edge)
+    solid.remove_vertex(tip)
+    for dead in (out_he, back_he, edge, tip):
+        kernel.destroy(dead)
+
+
+# --------------------------------------------------------------------------- #
 # KEF - Kill Edge Face (inverse of MEF)
 # --------------------------------------------------------------------------- #
 def kef(kernel: Kernel, edge: Edge) -> None:

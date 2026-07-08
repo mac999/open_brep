@@ -281,6 +281,73 @@ def test_trim_edge_follows_curve():
     print("  [ok] curved edge split on the curve at z=3 (not the chord)")
 
 
+def test_numeric_intersection():
+    print("test_numeric_intersection")
+    from brep.geometry import (NURBSSurface, TrimPlane, surface_closest_point,
+                               ray_surface_intersect_ex, surface_plane_section)
+    k = Kernel()
+    d = macro.create_nurbs_dome(k, 20.0, 8.0)
+    surf = next(f.surface for f in d.faces if isinstance(f.surface, NURBSSurface))
+    # Closest-point projection (Beer Alg. 2): a point above the apex projects to it.
+    u, v, foot = surface_closest_point(surf, Point3D(0, 0, 10))
+    assert abs(u - 0.5) < 1e-6 and abs(v - 0.5) < 1e-6
+    assert (foot - Point3D(0, 0, 4)).length() < 1e-9
+    # Ray refinement (Beer Alg. 3): the contact lies on the TRUE surface, not a
+    # facet (facet-only accuracy was ~3e-3); and exactly on the ray in x,y.
+    hit = ray_surface_intersect_ex(Point3D(2.3, 1.7, -5), Point3D(0, 0, 1), surf)
+    assert hit is not None
+    p, _t, hu, hv = hit
+    assert abs(p.x - 2.3) < 1e-9 and abs(p.y - 1.7) < 1e-9
+    assert (surf.evaluate(hu, hv) - p).length() < 1e-9
+    # Section extraction: the cap plane z=3 yields ONE closed loop, every point
+    # of which lies on the plane and on the surface (parametric reconnection).
+    plane = TrimPlane(Point3D(0, 0, 1), 3.0)
+    loops = surface_plane_section(surf, plane)
+    closed = [pts for c, pts in loops if c]
+    assert len(closed) == 1, f"expected one closed section loop, got {loops}"
+    for su, sv, sp in closed[0]:
+        assert abs(plane.signed_distance(sp)) < 1e-8
+        assert (surf.evaluate(su, sv) - sp).length() < 1e-9
+    print(f"  [ok] projection exact, ray contact on true surface, "
+          f"closed section loop of {len(closed[0])} pts")
+
+
+def test_trim_cap_section_ring():
+    print("test_trim_cap_section_ring")
+    from brep.geometry import NURBSSurface
+    # The interior cap cut must UPDATE THE TOPOLOGY: the section curve becomes a
+    # real loop of vertices/edges (cap face + inner ring), traversable through
+    # the half-edge structure -- not just a render-time tag.
+    k = Kernel()
+    d = macro.create_nurbs_dome(k, 20.0, 8.0)
+    macro.trim_solid_by_plane(k, d, 0, 0, 1, 3.0)
+    _assert_valid(d, "dome after cap trim with section ring")
+    rep = check_solid(d)
+    assert rep.rings == 1, f"section must appear as an inner ring, rings={rep.rings}"
+    assert rep.f == 3, f"cap face must be split off, F={rep.f}"
+    # The kept cap face's outer loop IS the section: walk it via topology.
+    cap = next(f for f in d.faces
+               if not getattr(f, "discarded", False)
+               and isinstance(f.surface, NURBSSurface))
+    ring_verts = [he.vertex for he in cap.outer.halfedges()]
+    assert len(ring_verts) >= 12
+    for v in ring_verts:
+        assert abs(v.point.z - 3.0) < 1e-8, "section vertex must lie on the plane"
+        uv = getattr(v, "on_surface_uv", None)
+        assert uv is not None, "section vertex must carry its surface parameters"
+        assert (cap.surface.evaluate(*uv) - v.point).length() < 1e-9, \
+            "section vertex must lie on the surface at its stored (u,v)"
+    # keep below: the annulus (outer boundary + ring) survives instead.
+    k2 = Kernel()
+    d2 = macro.create_nurbs_dome(k2, 20.0, 8.0)
+    macro.trim_solid_by_plane(k2, d2, 0, 0, 1, 3.0, keep_below=True)
+    _assert_valid(d2, "dome cap trim keep-below")
+    keepers = [f for f in d2.faces if not getattr(f, "discarded", False)]
+    assert any(len(f.loops) > 1 for f in keepers), \
+        "keep-below must retain the ringed annulus face"
+    print(f"  [ok] section ring of {len(ring_verts)} verts traversable via topology")
+
+
 def test_extend_curve_to_plane():
     print("test_extend_curve_to_plane")
     from brep.geometry import TrimPlane
@@ -309,9 +376,14 @@ def test_extend_curve_to_surface():
     edge, _v1 = eu.mev(k, v0, Point3D(0, 0, -3))     # wire pointing +z
     new_v, _new_e = macro.extend_curve(k, edge, ("surface", surf))
     # apex of this dome is z=4 at (0,0); the +z ray must hit the surface there.
-    assert (new_v.point - Point3D(0, 0, 4)).length() < 1e-3, \
+    assert (new_v.point - Point3D(0, 0, 4)).length() < 1e-6, \
         f"extended vertex must land on the dome apex, got {new_v.point}"
-    print(f"  [ok] wire extended onto NURBS surface at {new_v.point}")
+    # The contact carries its parametric address on the target surface, and the
+    # surface evaluated there reproduces the contact point (Newton-refined).
+    uv = getattr(new_v, "on_surface_uv", None)
+    assert uv is not None, "surface contact must store (u,v) on the target"
+    assert (surf.evaluate(*uv) - new_v.point).length() < 1e-9
+    print(f"  [ok] wire extended onto NURBS surface at {new_v.point}, uv={uv}")
 
 
 def test_extend_face_to_plane():
@@ -352,6 +424,177 @@ def test_extend_face_to_surface():
     print(f"  [ok] sheet cap conforms to the dome ({len(cap)} vertices on surface)")
 
 
+def _crossing_pair(k):
+    """Dome A (apex z=4) and dome B flipped into a bowl at z=5 (dip z=1)."""
+    from brep.geometry import NURBSSurface
+    da = macro.create_nurbs_dome(k, 20.0, 8.0)
+    fa = next(f for f in da.faces if isinstance(f.surface, NURBSSurface))
+    db = macro.create_nurbs_dome(k, 20.0, 8.0)
+    fb = next(f for f in db.faces if isinstance(f.surface, NURBSSurface))
+    net = [[Point3D(p.x, p.y, 5.0 - p.z) for p in row]
+           for row in fb.surface.control_net]
+    fb.surface = NURBSSurface(net, 2, 2)
+    for v in db.vertices:
+        v.point = Point3D(v.point.x, v.point.y, 5.0)
+    return fa, fb
+
+
+def test_kev_inverse_of_mev():
+    print("test_kev_inverse_of_mev")
+    k = Kernel()
+    s, _f, v0 = eu.mvfs(k, Point3D(0, 0, 0))
+    e1, _v1 = eu.mev(k, v0, Point3D(5, 0, 0))
+    e2, _v2 = eu.mev(k, _v1, Point3D(5, 5, 0))
+    eu.kev(k, e2)
+    assert (s.num_vertices, s.num_edges) == (2, 1)
+    _assert_valid(s, "wire after KEV of the tip spike")
+    eu.kev(k, e1)                       # degenerates back to the MVFS seed
+    assert (s.num_vertices, s.num_edges) == (1, 0)
+    _e3, _v3 = eu.mev(k, v0, Point3D(1, 1, 0))   # seed must be regrowable
+    _assert_valid(s, "wire regrown from restored seed")
+    # KEV must refuse a manifold (non-spike) edge.
+    k2 = Kernel()
+    b = macro.create_box(k2, 5, 5, 5)
+    try:
+        eu.kev(k2, b.edges[0])
+        assert False, "KEV accepted a manifold edge"
+    except ValueError:
+        pass
+    print("  [ok] KEV removes spikes, restores the seed, rejects manifold edges")
+
+
+def test_surface_surface_intersection():
+    print("test_surface_surface_intersection")
+    k = Kernel()
+    fa, fb = _crossing_pair(k)
+    wire, closed, n = macro.intersect_surfaces(k, fa, fb)
+    assert closed and n >= 16
+    _assert_valid(wire, "SSI wire")
+    # Every wire vertex lies on BOTH surfaces at its stored parameters.
+    ra = max((fa.surface.evaluate(*v.on_surface_uv) - v.point).length()
+             for v in wire.vertices)
+    rb = max((fb.surface.evaluate(*v.on_surface_uv_b) - v.point).length()
+             for v in wire.vertices)
+    assert ra < 1e-6 and rb < 1e-6, f"SSI residuals too large: {ra}, {rb}"
+    print(f"  [ok] closed SSI loop of {n} pts, on both surfaces "
+          f"(residuals {ra:.1e}/{rb:.1e})")
+
+
+def test_trim_by_surface():
+    print("test_trim_by_surface")
+    from brep.geometry import NURBSSurface, SurfaceCutter
+    k = Kernel()
+    dome = macro.create_nurbs_dome(k, 20.0, 8.0)
+    fa = next(f for f in dome.faces if isinstance(f.surface, NURBSSurface))
+    box = macro.create_box(k, 8, 8, 8, origin=Point3D(-4, -4, 0))
+    res = macro.trim_solid_by_surface(k, box, fa, keep_below=True)
+    assert res.is_topological and res.n_cut > 0 and res.n_discard > 0
+    _assert_valid(box, "box trimmed by a curved NURBS cutter")
+    # Split vertices must land ON the curved cutter, not on a linear chord.
+    cutter = SurfaceCutter(fa.surface)
+    split_vs = [v for v in box.vertices
+                if 0.01 < abs(v.point.z) and abs(v.point.z - 8) > 0.01
+                and abs(v.point.z) > 0.01 and 0.01 < v.point.z < 7.99]
+    assert split_vs, "expected split vertices on the box sides"
+    worst = max(abs(cutter.signed_distance(v.point)) for v in split_vs)
+    assert worst < 1e-6, f"split vertex off the cutter surface by {worst}"
+    # The section must FOLLOW the curved intersection, not jump across it with
+    # one straight chord per face: every section sub-edge midpoint stays close
+    # to the cutter (a single chord would deviate by ~0.32 here).
+    sub_edges = [e for e in box.edges
+                 if 0.01 < e.he1.vertex.point.z < 7.99
+                 and 0.01 < e.he1.end_vertex.point.z < 7.99]
+    assert len(sub_edges) >= 16, "cut edges must be refined into a polyline"
+    sag = max(abs(cutter.signed_distance(
+        (e.he1.vertex.point + e.he1.end_vertex.point) * 0.5))
+        for e in sub_edges)
+    assert sag < 0.05, f"section polyline strays {sag} from the true curve"
+    print(f"  [ok] box carved by dome: cut={res.n_cut}, "
+          f"{len(split_vs)} split verts on the cutter (max {worst:.1e}), "
+          f"section polyline sagitta {sag:.3f}")
+
+
+def test_blend_patch():
+    print("test_blend_patch")
+    from brep.geometry import (NURBSSurface, surface_closest_point,
+                               surface_normal)
+    k = Kernel()
+    fa, fb = _crossing_pair(k)
+    bl = macro.blend_surfaces(k, fa, fb, width=1.5, samples=9)
+    _assert_valid(bl, "blend patch lamina")
+    patch = next(f.surface for f in bl.faces if f.surface)
+    assert patch.degree_v == 5, "blend cross-sections must be quintic"
+    m = patch.n_u
+    # The patch boundary must INTERPOLATE the rails: at every sample station
+    # the v=0 / v=1 edges lie on surface A / B respectively.
+    for kk in range(m):
+        t = kk / (m - 1)
+        pa = patch.evaluate(t, 0.0)
+        _u, _v, foot_a = surface_closest_point(fa.surface, pa)
+        assert (foot_a - pa).length() < 1e-6, "rail A station off surface A"
+        pb = patch.evaluate(t, 1.0)
+        _u, _v, foot_b = surface_closest_point(fb.surface, pb)
+        assert (foot_b - pb).length() < 1e-6, "rail B station off surface B"
+    # Tangent continuity: the cross-boundary tangent at a station lies in
+    # surface A's tangent plane (dot with the normal ~ 0).
+    h = 1e-4
+    p0 = patch.evaluate(0.5, 0.0)
+    p1 = patch.evaluate(0.5, h)
+    d1 = (p1 - p0) * (1.0 / h)
+    u, v, _foot = surface_closest_point(fa.surface, p0)
+    n_dot = abs(d1.normalized().dot(surface_normal(fa.surface, u, v)))
+    assert n_dot < 5e-3, f"cross tangent leaves the tangent plane: {n_dot}"
+    print(f"  [ok] quintic blend interpolates both rails at {m} stations, "
+          f"tangent-plane deviation {n_dot:.1e}")
+
+
+def test_pcurve_step_export():
+    print("test_pcurve_step_export")
+    import io as _io
+    from brep import stepio
+    k = Kernel()
+    d = macro.create_nurbs_dome(k, 20.0, 8.0)
+    macro.trim_solid_by_plane(k, d, 0, 0, 1, 3.0)      # cap ring trim
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as td:
+        fp = os.path.join(td, "cap.step")
+        stepio.save(d, fp)
+        text = open(fp).read()
+        # Analytic: ONE trimmed ADVANCED_FACE over the full B-spline surface,
+        # every section edge carrying a PCURVE in (u,v) space.
+        assert text.count("ADVANCED_FACE") == 1
+        assert text.count("B_SPLINE_SURFACE_WITH_KNOTS") == 1
+        assert text.count("PCURVE(") == 24
+        assert text.count("DEFINITIONAL_REPRESENTATION") == 24
+        assert "OPEN_SHELL" in text
+        fp2 = os.path.join(td, "cap_faceted.step")
+        stepio.save(d, fp2, faceted=True)
+        t2 = open(fp2).read()
+        assert t2.count("ADVANCED_FACE") > 100 and "PCURVE(" not in t2
+    print("  [ok] trimmed NURBS exports analytically (surface + 24 pcurves); "
+          "faceted fallback intact")
+
+
+def test_transform_updates_geometry():
+    print("test_transform_updates_geometry")
+    from brep.controller import BRepShell
+    from brep.geometry import NURBSSurface
+    import io as _io, contextlib
+    sh = BRepShell()
+    with contextlib.redirect_stdout(_io.StringIO()):
+        sh.onecmd("create nurbs 20 8 as @d")
+        sh.onecmd("rotate @d x 180")
+        sh.onecmd("move @d 0 0 5")
+    solid = sh.kernel.solids[0]
+    surf = next(f.surface for f in solid.faces if f.surface)
+    apex = surf.evaluate(0.5, 0.5)
+    # Rotated 180 deg about x then raised by 5: the apex z=4 must land at z=1.
+    assert abs(apex.z - 1.0) < 1e-9, f"surface did not follow the transform: {apex}"
+    # And the topology moved with it (lamina verts at z=5).
+    assert all(abs(v.point.z - 5.0) < 1e-9 for v in solid.vertices)
+    print("  [ok] move/rotate transform BOTH the vertices and the NURBS net")
+
+
 def test_kef_inverse_of_mef():
     print("test_kef_inverse_of_mef")
     k = Kernel()
@@ -384,10 +627,18 @@ def run_all():
         test_trim_surface_region,
         test_trim_nurbs_cap_by_plane,
         test_trim_edge_follows_curve,
+        test_numeric_intersection,
+        test_trim_cap_section_ring,
         test_extend_curve_to_plane,
         test_extend_curve_to_surface,
         test_extend_face_to_plane,
         test_extend_face_to_surface,
+        test_kev_inverse_of_mev,
+        test_surface_surface_intersection,
+        test_trim_by_surface,
+        test_blend_patch,
+        test_pcurve_step_export,
+        test_transform_updates_geometry,
         test_kef_inverse_of_mef,
     ]
     for t in tests:

@@ -166,9 +166,10 @@ class BRepShell(cmd.Cmd):
     # 4.1  Micro topology commands
     # ------------------------------------------------------------------ #
     def do_micro(self, arg: str) -> None:
-        "micro mvfs|mev|mef ...  - invoke an atomic Euler operator"
+        "micro mvfs|mev|mef|kev|kef|semv|kemr|mekr|kfmr|mfkr ...  - atomic Euler operators"
         tokens = shlex.split(arg)
-        _expect(bool(tokens), "usage: micro <mvfs|mev|mef> ...")
+        _expect(bool(tokens),
+                "usage: micro <mvfs|mev|mef|kev|kef|semv|kemr|mekr|kfmr|mfkr> ...")
         op = tokens[0].lower()
         rest = tokens[1:]
         if op == "mvfs":
@@ -177,6 +178,20 @@ class BRepShell(cmd.Cmd):
             self._micro_mev(rest)
         elif op == "mef":
             self._micro_mef(rest)
+        elif op == "kev":
+            self._micro_kev(rest)
+        elif op == "kef":
+            self._micro_kef(rest)
+        elif op in ("semv", "split"):
+            self._micro_semv(rest)
+        elif op == "kemr":
+            self._micro_kemr(rest)
+        elif op == "mekr":
+            self._micro_mekr(rest)
+        elif op == "kfmr":
+            self._micro_kfmr(rest)
+        elif op == "mfkr":
+            self._micro_mfkr(rest)
         else:
             raise CliError(f"unknown micro operator '{op}'")
 
@@ -235,6 +250,77 @@ class BRepShell(cmd.Cmd):
         self._bind_alias(as_spec, face)
         self._out(view.format_entity_created("Face", face.oid,
                   f"(edge #{edge.oid})"))
+
+    def _micro_kev(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 1, "usage: micro kev #<edge>")
+        edge = self.kernel.get(self._resolve_id(tokens[0]))
+        _expect(isinstance(edge, Edge), f"{tokens[0]} is not an edge")
+        eu.kev(self.kernel, edge)
+        self._out(f"KEV: killed spike edge #{edge.oid} and its tip vertex (-1V -1E)")
+
+    def _micro_kef(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 1, "usage: micro kef #<edge>")
+        edge = self.kernel.get(self._resolve_id(tokens[0]))
+        _expect(isinstance(edge, Edge), f"{tokens[0]} is not an edge")
+        eu.kef(self.kernel, edge)
+        self._out(f"KEF: killed edge #{edge.oid}, merged its two faces (-1E -1F)")
+
+    def _micro_semv(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 4, "usage: micro semv #<edge> <x> <y> <z>")
+        edge = self.kernel.get(self._resolve_id(tokens[0]))
+        _expect(isinstance(edge, Edge), f"{tokens[0]} is not an edge")
+        x, y, z = (float(t) for t in tokens[1:])
+        new_edge, v = eu.split_edge(self.kernel, edge, Point3D(x, y, z))
+        self._out(f"SEMV: split edge #{edge.oid} -> new vertex #{v.oid}, "
+                  f"new edge #{new_edge.oid} (+1V +1E)")
+
+    def _micro_kemr(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 1, "usage: micro kemr #<edge>")
+        edge = self.kernel.get(self._resolve_id(tokens[0]))
+        _expect(isinstance(edge, Edge), f"{tokens[0]} is not an edge")
+        ring, _dead = eu.kemr(self.kernel, edge.he1)
+        self._out(f"KEMR: killed edge #{edge.oid}, made ring loop #{ring.oid} "
+                  f"(-1E +1R)")
+
+    def _micro_mekr(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 2, "usage: micro mekr #<v_outer> #<v_ring>")
+        v_out = self.kernel.get(self._resolve_id(tokens[0]))
+        v_ring = self.kernel.get(self._resolve_id(tokens[1]))
+        _expect(isinstance(v_out, Vertex) and isinstance(v_ring, Vertex),
+                "both arguments to mekr must be vertices")
+        he_outer = he_ring = None
+        for lp in eu._loops_around(v_out):
+            face = lp.face
+            for ring in face.inner:
+                cand = eu.find_outgoing_in_loop(ring, v_ring)
+                if cand is not None:
+                    he_outer = eu.find_outgoing_in_loop(face.outer, v_out)
+                    he_ring = cand
+                    break
+            if he_ring is not None:
+                break
+        _expect(he_outer is not None and he_ring is not None,
+                "mekr: the two vertices must lie on the outer loop and an "
+                "inner ring of the same face")
+        edge = eu.mekr(self.kernel, he_outer, he_ring)
+        self._out(f"MEKR: bridged ring to outer loop with edge #{edge.oid} "
+                  f"(+1E -1R)")
+
+    def _micro_kfmr(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 1, "usage: micro kfmr #<face>")
+        face = self.kernel.get(self._resolve_id(tokens[0]))
+        _expect(isinstance(face, Face), f"{tokens[0]} is not a face")
+        ring = eu.kfmr(self.kernel, face)
+        self._out(f"KFMR: killed face #{face.oid}, its loop #{ring.oid} became "
+                  f"a ring of the adjacent face (-1F +1R, genus+1)")
+
+    def _micro_mfkr(self, tokens: List[str]) -> None:
+        _expect(len(tokens) == 1, "usage: micro mfkr #<loop>")
+        loop = self.kernel.get(self._resolve_id(tokens[0]))
+        _expect(isinstance(loop, Loop), f"{tokens[0]} is not a loop")
+        face = eu.mfkr(self.kernel, loop)
+        self._out(f"MFKR: promoted ring loop #{loop.oid} into face #{face.oid} "
+                  f"(+1F -1R, genus-1)")
 
     # ------------------------------------------------------------------ #
     # 4.2  Macro modeling commands
@@ -354,6 +440,35 @@ class BRepShell(cmd.Cmd):
                         "usage: trim surface #<face> keep <u0> <u1> <v0> <v1>  "
                         "(or: by #<loop>)")
 
+        elif len(tokens) >= 3 and tokens[1].lower() == "by" \
+                and tokens[2].lower() == "surface":
+            # trim #<solid> by surface #<face> [keep above|below]
+            _expect(
+                len(tokens) == 4
+                or (len(tokens) == 6 and tokens[4].lower() == "keep"),
+                "usage: trim #<solid> by surface #<face> [keep above|below]",
+            )
+            entity = self.kernel.get(self._resolve_id(tokens[0]))
+            solid = self.kernel.solid_of(entity)
+            _expect(solid is not None, f"#{entity.oid} is not part of any solid")
+            cutter_face = self.kernel.get(self._resolve_id(tokens[3]))
+            _expect(isinstance(cutter_face, Face),
+                    f"cutter #{tokens[3]} is not a face")
+            keep_below = False
+            if len(tokens) == 6:
+                side = tokens[5].lower()
+                _expect(side in ("above", "below", "+", "-"),
+                        "keep side must be 'above' or 'below'")
+                keep_below = side in ("below", "-")
+            result = macro.trim_solid_by_surface(
+                self.kernel, solid, cutter_face, keep_below=keep_below)
+            self._out(
+                f"trim solid #{solid.oid} by NURBS surface of face "
+                f"#{cutter_face.oid} keep={'below' if keep_below else 'above'} "
+                f"(above = the cutter-normal side):\n"
+                f"  keep={result.n_keep}  cut={result.n_cut}  discard={result.n_discard}"
+            )
+
         else:
             # trim #<solid> by plane <nx> <ny> <nz> <d> [keep above|below]
             _expect(
@@ -361,7 +476,8 @@ class BRepShell(cmd.Cmd):
                  or (len(tokens) == 9 and tokens[7].lower() == "keep"))
                 and tokens[1].lower() == "by"
                 and tokens[2].lower() == "plane",
-                "usage: trim #<solid> by plane <nx> <ny> <nz> <d> [keep above|below]",
+                "usage: trim #<solid> by plane <nx> <ny> <nz> <d> [keep above|below]"
+                "  |  trim #<solid> by surface #<face> [keep above|below]",
             )
             entity = self.kernel.get(self._resolve_id(tokens[0]))
             solid = self.kernel.solid_of(entity)
@@ -437,6 +553,86 @@ class BRepShell(cmd.Cmd):
             )
         else:
             _expect(False, f"#{tokens[0]} is not an edge or a face")
+
+    def do_intersect(self, arg: str) -> None:
+        "intersect #<faceA> #<faceB> [samples <n>] [as @name]  - NURBS/NURBS intersection curve as a wire"
+        tokens = shlex.split(arg)
+        tokens, as_spec = self._split_as(tokens)
+        samples = 32
+        lowered = [t.lower() for t in tokens]
+        if "samples" in lowered:
+            idx = lowered.index("samples")
+            _expect(idx + 1 < len(tokens), "usage: ... samples <n>")
+            samples = int(tokens[idx + 1])
+            tokens = tokens[:idx] + tokens[idx + 2:]
+        _expect(len(tokens) == 2,
+                "usage: intersect #<faceA> #<faceB> [samples <n>] [as @name]")
+        face_a = self.kernel.get(self._resolve_id(tokens[0]))
+        face_b = self.kernel.get(self._resolve_id(tokens[1]))
+        _expect(isinstance(face_a, Face) and isinstance(face_b, Face),
+                "intersect needs two faces (each carrying a NURBS surface)")
+        wire, closed, n = macro.intersect_surfaces(
+            self.kernel, face_a, face_b, samples=samples)
+        self._bind_alias(as_spec, wire)
+        self._out(
+            f"+ created intersection wire Solid #{wire.oid}: "
+            f"{'closed loop' if closed else 'open curve'} of {n} points\n"
+            f"  each vertex stores (u,v) on BOTH surfaces "
+            f"(disp math #<vertex>); branch data on faces "
+            f"#{face_a.oid}/#{face_b.oid} (disp math)"
+        )
+
+    def do_blend(self, arg: str) -> None:
+        "blend #<faceA> #<faceB> width <w> [samples <n>] [as @name]  - G2 blend patch across the intersection"
+        tokens = shlex.split(arg)
+        tokens, as_spec = self._split_as(tokens)
+        lowered = [t.lower() for t in tokens]
+        _expect("width" in lowered,
+                "usage: blend #<faceA> #<faceB> width <w> [samples <n>] [as @name]")
+        wi = lowered.index("width")
+        _expect(wi + 1 < len(tokens), "usage: ... width <w>")
+        width = float(tokens[wi + 1])
+        rest = tokens[:wi] + tokens[wi + 2:]
+        samples = 9
+        lowered = [t.lower() for t in rest]
+        if "samples" in lowered:
+            si = lowered.index("samples")
+            _expect(si + 1 < len(rest), "usage: ... samples <n>")
+            samples = int(rest[si + 1])
+            rest = rest[:si] + rest[si + 2:]
+        _expect(len(rest) == 2,
+                "usage: blend #<faceA> #<faceB> width <w> [samples <n>] [as @name]")
+        face_a = self.kernel.get(self._resolve_id(rest[0]))
+        face_b = self.kernel.get(self._resolve_id(rest[1]))
+        _expect(isinstance(face_a, Face) and isinstance(face_b, Face),
+                "blend needs two faces (each carrying a NURBS surface)")
+        solid = macro.blend_surfaces(self.kernel, face_a, face_b,
+                                     width=width, samples=samples)
+        self._bind_alias(as_spec, solid)
+        patch = next(f.surface for f in solid.faces if f.surface)
+        self._out(
+            f"+ created blend Solid #{solid.oid}: quintic Hermite patch "
+            f"(net {patch.n_u}x{patch.n_v}, degree {patch.degree_u}x"
+            f"{patch.degree_v}) matching position + 1st + 2nd derivative "
+            f"on both rails (curvature-continuous join)"
+        )
+
+    def do_delete(self, arg: str) -> None:
+        "delete #<solid>  - remove a solid and everything it owns"
+        tokens = shlex.split(arg)
+        _expect(len(tokens) == 1, "usage: delete #<solid>")
+        entity = self.kernel.get(self._resolve_id(tokens[0]))
+        solid = self.kernel.solid_of(entity)
+        _expect(solid is not None, f"#{tokens[0]} is not part of any solid")
+        oid, name = solid.oid, solid.name
+        self.kernel.delete_solid(solid)
+        # Drop aliases that pointed into the deleted solid.
+        dead = [a for a, target in self.aliases.items()
+                if self.kernel.find(target) is None]
+        for a in dead:
+            del self.aliases[a]
+        self._out(f"- deleted Solid #{oid} '{name}'"
+                  + (f" (unbound @{', @'.join(dead)})" if dead else ""))
 
     def do_view(self, arg: str) -> None:
         "view [solid|wire|points] [#id|@alias|$solid]  - open 3-D interactive viewer"
@@ -568,9 +764,38 @@ class BRepShell(cmd.Cmd):
         raise CliError(f"#{entity.oid} cannot be transformed")
 
     def _apply_transform(self, entity, matrix) -> None:
+        # Topology side: move every owned vertex.
         for v in self._vertices_of(entity):
             if v.point is not None:
                 v.point = apply_matrix(matrix, v.point)
+        # Geometry side: the attached NURBS control nets and Bezier control
+        # points must follow, or the surface/curve would detach from its
+        # boundary (topology and geometry always update together).
+        faces: List[Face] = []
+        edges: List[Edge] = []
+        if isinstance(entity, Solid):
+            faces = list(entity.faces)
+            edges = list(entity.edges)
+        elif isinstance(entity, Face):
+            faces = [entity]
+            edges = [he.edge for lp in entity.loops
+                     for he in lp.halfedges() if he.edge]
+        elif isinstance(entity, Edge):
+            edges = [entity]
+        for f in faces:
+            surf = getattr(f, "surface", None)
+            if isinstance(surf, NURBSSurface):
+                surf.control_net = [[apply_matrix(matrix, p) for p in row]
+                                    for row in surf.control_net]
+        seen = set()
+        for e in edges:
+            if e is None or e.oid in seen:
+                continue
+            seen.add(e.oid)
+            curve = getattr(e, "curve", None)
+            if isinstance(curve, Bezier):
+                curve.control_points = [apply_matrix(matrix, p)
+                                        for p in curve.control_points]
 
     @staticmethod
     def _centroid(verts: List[Vertex]) -> Point3D:
@@ -687,16 +912,22 @@ class BRepShell(cmd.Cmd):
         self._out(f"--- finished {path} ---")
 
     def do_save(self, arg: str) -> None:
-        'save "<file.step>" [#solid]  - export a solid to STEP'
+        'save "<file.step>" [#solid] [faceted]  - export a solid to STEP'
         tokens = shlex.split(arg)
-        _expect(len(tokens) in (1, 2), 'usage: save "<file.step>" [#solid]')
+        faceted = False
+        if tokens and tokens[-1].lower() == "faceted":
+            faceted = True
+            tokens = tokens[:-1]
+        _expect(len(tokens) in (1, 2),
+                'usage: save "<file.step>" [#solid] [faceted]')
         path = tokens[0]
         solid = self._resolve_solid(tokens[1:]) if len(tokens) == 2 else None
         if solid is None:
             _expect(bool(self.kernel.solids), "no solids to save")
             solid = self.kernel.solids[0]
-        stepio.save(solid, path)
-        self._out(f"saved solid #{solid.oid} -> {path}")
+        stepio.save(solid, path, faceted=faceted)
+        mode = " (faceted trim shells)" if faceted else ""
+        self._out(f"saved solid #{solid.oid} -> {path}{mode}")
 
     def do_load(self, arg: str) -> None:
         'load "<file.step>"  - import points from a STEP file'
@@ -948,13 +1179,37 @@ class BRepShell(cmd.Cmd):
 
             TOPOLOGICAL trim for ALL solids (lamina, box, sphere, cylinder):
               * split_edge inserts exact intersection vertices on crossing edges
+                (an edge carrying a Bezier is cut ON its curve, not the chord)
               * MEF splits each straddling face into keep / discard halves
+              * an interior CAP cut (the surface crosses, the flat boundary does
+                not) extracts the section curve in the surface's (u,v) space and
+                lifts it into the topology: a cap face + inner RING via
+                MEV-bridge / MEV-chain / MEF / KEMR; every section vertex lies
+                on the true surface and stores its (u,v) (see disp math)
               * discard-side faces are flagged; NURBS is cropped to the keep half
-              * topology stays a valid closed manifold (Euler invariant holds)
+              * topology stays a valid manifold (Euler V-E+F-R invariant holds)
               * 'save' writes an OPEN_SHELL of the surviving faces
             A cut through existing vertices (e.g. sphere at its equator) needs no
             edge split; those vertices form the section boundary directly.
             Only a plane that misses the solid falls back to parametric metadata.
+
+        4)  trim #<solid> by surface #<face> [keep above|below]
+            Half-space cut by a CURVED NURBS surface (NURBS x NURBS trim).
+            The cutter face's surface becomes a signed-distance field
+            (closest-point projection + normal sign), and the same topological
+            pipeline runs against it: crossing edges are bisected onto the
+            curved cutter, straddling faces MEF-cut, interior sections become
+            rings. 'keep above' = the side the cutter's NORMAL points to
+            (note: 'create nurbs' domes have a -z normal), 'keep below' the
+            other side.
+
+              // box carved by a dome surface (keep the part above the dome)
+              create nurbs 20 8 as @dome
+              set @cutter $face
+              create box 8 8 8 as @bx
+              move @bx -4 -4 0
+              trim @bx by surface @cutter keep below
+              check validity @bx
 
         Arrange the plane so it slices THROUGH the solid (perpendicular or
         oblique), not parallel to a face or merely grazing it.
@@ -1020,8 +1275,12 @@ class BRepShell(cmd.Cmd):
             exact contact point and a new edge is appended (Euler +1V +1E). The
             end whose forward tangent reaches the target is chosen automatically.
               target 'plane'   -> line-plane intersection (closed form)
-              target #<face>   -> plane of that face, or its NURBS surface
-                                  (ray-surface intersection) when it carries one
+              target #<face>   -> plane of that face, or its NURBS surface when
+                                  it carries one: a tessellation hit seeds a
+                                  Newton iteration (closest-point projection on
+                                  the surface tangents), so the contact lies on
+                                  the TRUE surface and stores its (u,v) address
+                                  (shown by 'disp math #<vertex>')
 
         3)  extend #<face> to plane <nx> <ny> <nz> <d> [along <dx> <dy> <dz>]
         4)  extend #<face> to #<face> [along <dx> <dy> <dz>]
@@ -1067,6 +1326,81 @@ class BRepShell(cmd.Cmd):
           extend $face to @df
         """)
 
+    def help_intersect(self) -> None:
+        self._h(f"""
+        intersect -- NURBS x NURBS surface-surface intersection (SSI)
+        {self._HR}
+        intersect #<faceA> #<faceB> [samples <n>] [as @name]
+
+        Computes the intersection curve of two NURBS faces and lifts it into
+        the model as a WIRE solid (vertex/edge chain; a closed loop is closed
+        with MEF). The algorithm turns surface B into a signed-distance field
+        over surface A's (u,v) grid (closest-point projection + normal sign),
+        marches the zero set in A's parameter space, refines every point by
+        bisection on the true surface, then tightens each point onto the exact
+        intersection by alternating projections between BOTH surfaces.
+
+        The curve is delivered in all three classic representations:
+          * the 3D wire itself (view / save / disp)
+          * (u,v) on surface A   -> vertex.on_surface_uv    (disp math #<vertex>)
+          * (u,v) on surface B   -> vertex.on_surface_uv_b
+        Branch data is also recorded on both faces (disp math #<face>).
+
+        Example (two domes arranged to cross -- copy/paste and run as-is):
+          create nurbs 20 8 as @a
+          set @fa $face
+          create nurbs 20 8 as @b
+          set @fb $face
+          rotate @b x 180                  // flip the second dome into a bowl
+          move @b 0 0 5                    // the bowl now dips into the dome
+          intersect @fa @fb as @c          // -> closed intersection loop
+          check validity @c
+          disp math $vertex                // (u,v) on BOTH surfaces
+        """)
+
+    def help_blend(self) -> None:
+        self._h(f"""
+        blend -- curvature-continuous (G2) blend patch across an intersection
+        {self._HR}
+        blend #<faceA> #<faceB> width <w> [samples <n>] [as @name]
+
+        Builds a smooth NURBS strip joining surface A to surface B across
+        their intersection curve:
+
+          1. The NURBS x NURBS intersection is computed (see 'help intersect').
+          2. On each surface a RAIL is offset 'width' from the curve along the
+             in-surface direction perpendicular to it (away from the other
+             surface, orientation kept consistent along the curve).
+          3. At each rail the walk toward the intersection is differentiated
+             on the true surface (1st + 2nd directional derivatives).
+          4. Each cross-section is a QUINTIC HERMITE span matching position,
+             first AND second derivative at both rails -- a curvature-
+             continuous join with each host surface.
+          5. Control rows are solved so the patch INTERPOLATES every sampled
+             section (basis-matrix solve), then attached to a lamina solid.
+
+        Example (self-contained -- copy/paste and run as-is):
+          create nurbs 20 8 as @a
+          set @fa $face
+          create nurbs 20 8 as @b
+          set @fb $face
+          rotate @b x 180
+          move @b 0 0 5
+          blend @fa @fb width 1.5 as @bl   // degree 5 x 3 Hermite patch
+          check validity @bl
+          view @bl                         // rendered via exact B-spline eval
+        """)
+
+    def help_delete(self) -> None:
+        self._h(f"""
+        delete -- remove a solid from the model
+        {self._HR}
+        delete #<solid>|@alias|$solid
+
+        Unregisters the solid and every vertex/edge/half-edge/loop/face it
+        owns. Aliases that pointed into the deleted solid are unbound.
+        """)
+
     def help_micro(self) -> None:
         self._h(f"""
         micro <op> <args>  -- atomic Euler topology operators
@@ -1086,6 +1420,42 @@ class BRepShell(cmd.Cmd):
             vertices v1 and v2, splitting it into a new face.
             ΔEuler: +1E +1F
 
+        micro kev #<edge>
+            Kill Edge Vertex (inverse of mev) -- remove a dangling spike edge
+            together with its tip vertex. A one-edge wire degenerates back to
+            the mvfs seed state.
+            ΔEuler: -1V -1E
+
+        micro kef #<edge>
+            Kill Edge Face (inverse of mef) -- remove an edge separating two
+            distinct faces, merging them into one.
+            ΔEuler: -1E -1F
+
+        micro semv #<edge> <x> <y> <z>          (alias: micro split)
+            Split Edge Make Vertex -- insert a vertex at (x,y,z) on the edge,
+            updating both adjacent loops coherently.
+            ΔEuler: +1V +1E
+
+        micro kemr #<edge>
+            Kill Edge Make Ring -- remove an edge bordered twice by the same
+            face; the detached cycle becomes an inner ring of that face.
+            ΔEuler: -1E +1R
+
+        micro mekr #<v_outer> #<v_ring>
+            Make Edge Kill Ring (inverse of kemr) -- bridge an inner ring back
+            to the outer loop of its face with a new edge.
+            ΔEuler: +1E -1R
+
+        micro kfmr #<face>
+            Kill Face Make Ring -- destroy a single-loop face and re-home its
+            loop as an inner ring of the adjacent face (opens a handle).
+            ΔEuler: -1F +1R, genus+1
+
+        micro mfkr #<loop>
+            Make Face Kill Ring (inverse of kfmr) -- promote an inner ring
+            loop into its own face (closes a handle).
+            ΔEuler: +1F -1R, genus-1
+
         Manual box example (= 'create box 10 10 5'):
           micro mvfs 0 0 0
           micro mev $vertex 10 0 0
@@ -1093,6 +1463,11 @@ class BRepShell(cmd.Cmd):
           micro mev $vertex 0 10 0
           micro mef $vertex #<first_v>    // or use @alias to track first vertex
           extrude $face 0 0 5
+
+        Spike + undo example:
+          micro mvfs 0 0 0 as @w
+          micro mev $vertex 5 0 0         // +1V +1E
+          micro kev $edge                 // -1V -1E: back to the seed
         """)
 
     # ── geometry / editing ───────────────────────────────────────────── #
@@ -1231,16 +1606,23 @@ class BRepShell(cmd.Cmd):
 
     def help_save(self) -> None:
         self._h(f"""
-        save "<file.step>" [#solid]
+        save "<file.step>" [#solid] [faceted]
         {self._HR}
         Export a solid to STEP AP203 format.
           "<file.step>"  output file path (quotes required if path has spaces)
           [#solid]       optional solid to save; defaults to the first solid
+          [faceted]      export trimmed NURBS faces as keep-side triangle
+                         shells instead of analytic trimmed B-splines (for
+                         viewers with weak pcurve support)
 
         For untrimmed solids:   writes MANIFOLD_SOLID_BREP + CLOSED_SHELL
         For trimmed laminas:    writes SHELL_BASED_SURFACE_MODEL + OPEN_SHELL
                                 (discarded half-faces are omitted)
-        NURBS faces export as B_SPLINE_SURFACE_WITH_KNOTS.
+        NURBS faces export as B_SPLINE_SURFACE_WITH_KNOTS. A TRIMMED NURBS
+        face exports analytically by default: the full B-spline surface
+        bounded by its topological loops, each edge a SURFACE_CURVE pairing
+        the 3D chord with a PCURVE (a 2D B-spline in the surface's (u,v)
+        parameter space inside a DEFINITIONAL_REPRESENTATION, ISO 10303-42).
 
         Examples:
           save "box.step"                 // save first solid

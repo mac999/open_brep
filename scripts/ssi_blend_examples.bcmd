@@ -1,0 +1,103 @@
+// ssi_blend_examples.bcmd
+// =============================================================================
+// NURBS x NURBS demonstrations: surface-surface intersection (intersect),
+// trimming with a curved NURBS cutter (trim ... by surface), and a
+// curvature-continuous (G2) blend patch across the intersection (blend).
+//
+// PLACEMENT PRINCIPLE: the two shapes must OVERLAP so the WHOLE intersection
+// curve lies inside both -- position/rotate them first so the crossing region
+// is fully covered (here: both surfaces span the same [-10,10]^2 footprint,
+// and the trimmed box sits entirely inside it). A target that only partially
+// covers the source leaves the intersection curve clipped and the trim/extend
+// incomplete.
+//
+// Setup used throughout: dome A (apex z=4) and dome B rotated 180deg about x
+// into a BOWL, lifted to z=5 so its dip (z=1) plunges through A -- the two
+// surfaces genuinely cross in a closed interior loop.
+//
+// STEP files are saved into scripts/ssi_out/ at each stage. Trimmed NURBS
+// faces export analytically (B_SPLINE_SURFACE + PCURVE boundaries); append
+// 'faceted' to a save to get triangle shells instead.
+// =============================================================================
+
+
+// -- Setup: two crossing NURBS surfaces ---------------------------------------
+create nurbs 20 8 as @a
+set @fa $face                                      // dome A's NURBS face
+create nurbs 20 8 as @b
+set @fb $face                                      // dome B's NURBS face
+rotate @b x 180                                    // dome -> bowl (surface + verts)
+move @b 0 0 5                                      // bowl dips into dome A
+save "scripts/ssi_out/00_two_surfaces_a.step" @a
+save "scripts/ssi_out/00_two_surfaces_b.step" @b
+
+
+// -- Example 1: NURBS x NURBS intersection curve ------------------------------
+// Surface B becomes a signed-distance field over A's (u,v) grid; the zero set
+// is marched, refined, and tightened by alternating projections. The result is
+// a closed wire whose every vertex stores (u,v) on BOTH surfaces.
+intersect @fa @fb as @c
+check validity @c
+disp math $vertex                                  // (u,v) on A and on B
+save "scripts/ssi_out/01_intersection_wire.step" @c
+list
+
+
+// -- Example 2: Trim a box with a CURVED NURBS cutter -------------------------
+// The box sits ENTIRELY inside the dome's footprint (x,y in [-4,4] within
+// [-10,10]), so every side face crosses the surface and the whole section is
+// computable. Crossing box edges are bisected onto the curved surface,
+// straddling faces MEF-cut, and each cut edge is REFINED into a polyline that
+// follows the true box-side/dome intersection curve (not a single chord).
+// 'keep below' keeps the region opposite the cutter normal (the dome's normal
+// points -z, so this keeps the part ABOVE the dome).
+create box 8 8 8 as @bx
+move @bx -4 -4 0
+save "scripts/ssi_out/02_box_before.step" @bx
+trim @bx by surface @fa keep below
+check validity @bx
+save "scripts/ssi_out/02_box_after.step" @bx
+list
+
+
+// -- Example 2b: Trim one NURBS with ANOTHER NURBS (interior ring) ------------
+// Dome A and the bowl overlap across their full shared footprint, so their
+// closed intersection loop lies entirely inside dome A's face: the trim lifts
+// it into the topology as a cap face + inner RING (every section vertex on the
+// bowl surface). The flipped bowl's normal points +z, so 'keep above' keeps
+// the dome cap that pokes up through the bowl.
+create nurbs 20 8 as @a2
+set @fa2 $face
+create nurbs 20 8 as @b2
+set @fb2 $face
+rotate @b2 x 180
+move @b2 0 0 5
+save "scripts/ssi_out/02b_dome_before.step" @a2
+trim @a2 by surface @fb2 keep above
+check validity @a2                                 // rings=1, Euler holds
+save "scripts/ssi_out/02b_dome_by_bowl_after.step" @a2
+list
+
+
+// -- Example 3: Curvature-continuous blend patch ------------------------------
+// A quintic-Hermite strip joins A to B across their intersection: rails offset
+// width=1.5 on each surface, each cross-section matches position + 1st + 2nd
+// derivative at both rails, control rows solved so the patch interpolates
+// every sampled section.
+blend @fa @fb width 1.5 samples 9 as @bl
+check validity @bl
+disp math $face                                    // degree (3,5) control net
+save "scripts/ssi_out/03_blend_patch.step" @bl
+list
+
+
+// -- Example 4: Analytic pcurve export of a trimmed NURBS ---------------------
+// A cap-trimmed dome saves as ONE analytic ADVANCED_FACE: the full B-spline
+// surface bounded by the section ring, each boundary edge carrying a PCURVE
+// (2D B-spline in (u,v) space). Compare with the faceted variant.
+create nurbs 20 8 as @cap
+trim @cap by plane 0 0 1 3 keep above
+check validity @cap
+save "scripts/ssi_out/04_cap_pcurve.step" @cap
+save "scripts/ssi_out/04_cap_faceted.step" @cap faceted
+list

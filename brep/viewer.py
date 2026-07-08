@@ -67,7 +67,7 @@ def _nurbs_face_mesh(face: Face, nu: int, nv: int):
     """
     surf = face.surface
     plane = getattr(face, "trim_plane", None)
-    if isinstance(plane, TrimPlane):
+    if plane is not None and hasattr(plane, "signed_distance"):
         return tessellate_surface_trim(surf, plane, nu, nv)
     grid = _sample_nurbs(surf, nu, nv)
     points: List[Point3D] = []
@@ -99,12 +99,17 @@ def _eval_bezier(pts: List[Point3D], t: float) -> Point3D:
 def _sample_nurbs(surf: NURBSSurface, nu: int = 14, nv: int = 14
                   ) -> List[List[Point3D]]:
     """
-    Sample the NURBS surface at a (nu+1)×(nv+1) grid using pure Point3D
-    De Casteljau arithmetic — does not call surf.evaluate() so numpy is
-    not required.
+    Sample the NURBS surface at a (nu+1)×(nv+1) grid.
+
+    Bezier-sized nets (n_ctrl == degree+1 in both directions) use fast pure
+    De Casteljau; larger control nets (true B-splines, e.g. an interpolated
+    blend patch) fall back to the exact Cox-de-Boor ``surf.evaluate``.
 
     Returns rows of Point3D; row[i][j] = S(i/nu, j/nv).
     """
+    if surf.n_u != surf.degree_u + 1 or surf.n_v != surf.degree_v + 1:
+        return [[surf.evaluate(i / nu, j / nv) for j in range(nv + 1)]
+                for i in range(nu + 1)]
     rows: List[List[Point3D]] = []
     for i in range(nu + 1):
         u = i / nu
@@ -377,7 +382,7 @@ def _show_tkinter(solid: Solid, mode: str, title: str) -> None:
                 continue
             surf = getattr(face, 'surface', None)
             if isinstance(surf, NURBSSurface):
-                if isinstance(getattr(face, 'trim_plane', None), TrimPlane):
+                if hasattr(getattr(face, 'trim_plane', None), 'signed_distance'):
                     # Trimmed: draw the kept-side triangles' outlines.
                     pts_m, tris_m = _nurbs_face_mesh(face, 10, 10)
                     for (ta, tb, tc) in tris_m:

@@ -456,32 +456,119 @@ def ray_triangle_intersect(origin: "Point3D", direction: "Point3D",
     return t if t > tol else None
 
 
-def ray_surface_intersect(origin: "Point3D", direction: "Point3D",
-                          surf: "NURBSSurface", nu: int = 24, nv: int = 24):
+def surface_derivatives(surf: "NURBSSurface", u: float, v: float,
+                        h: float = 1e-5):
     """
-    Intersect a forward ray with a NURBS surface via its tessellation.
+    Evaluate the surface point and its first partial derivatives at ``(u, v)``.
 
-    Tessellates the surface into a triangle grid and returns the nearest
-    forward hit :class:`Point3D` (smallest ``t > 0``), or ``None``. This is the
-    mesh-based realization of the line-to-surface intersection (cf. the iterative
-    projection algorithm in Beer, *Algorithms for geometrical operations with
-    NURBS surfaces*): robust and analysis-suitable for the faceted surfaces this
-    kernel produces.
+    Returns ``(S, Su, Sv)`` where ``Su = ∂S/∂u`` and ``Sv = ∂S/∂v`` are computed
+    by central finite differences (one-sided at the domain boundary). These are
+    the tangent vectors ``v1``/``v2`` used by the numerical projection and
+    intersection iterations (Beer, *Algorithms for geometrical operations with
+    NURBS surfaces*, Alg. 2–3).
     """
+    u = min(max(u, 0.0), 1.0)
+    v = min(max(v, 0.0), 1.0)
+    ua, ub = max(u - h, 0.0), min(u + h, 1.0)
+    va, vb = max(v - h, 0.0), min(v + h, 1.0)
+    s = surf.evaluate(u, v)
+    su = (surf.evaluate(ub, v) - surf.evaluate(ua, v)) * (1.0 / (ub - ua))
+    sv = (surf.evaluate(u, vb) - surf.evaluate(u, va)) * (1.0 / (vb - va))
+    return s, su, sv
+
+
+def surface_closest_point(surf: "NURBSSurface", p: "Point3D",
+                          u0: float = 0.5, v0: float = 0.5,
+                          iters: int = 60, damp: float = 0.8,
+                          tol: float = 1e-12):
+    """
+    Project point ``p`` onto the surface: minimum-distance foot point.
+
+    Newton-style iteration on the tangent plane (Beer Alg. 2): the residual
+    ``p − S(u,v)`` is dotted with the tangent vectors ``Su``/``Sv`` to produce
+    parameter increments, clamped to the domain with a shrinking trust region
+    (``damp``) so curved surfaces cannot diverge.
+
+    Returns ``(u, v, foot_point)``.
+    """
+    u, v = min(max(u0, 0.0), 1.0), min(max(v0, 0.0), 1.0)
+    max_step = 0.5
+    for _ in range(iters):
+        s, su, sv = surface_derivatives(surf, u, v)
+        r = p - s
+        lu2 = su.dot(su)
+        lv2 = sv.dot(sv)
+        if lu2 < 1e-16 or lv2 < 1e-16:
+            break
+        du = su.dot(r) / lu2
+        dv = sv.dot(r) / lv2
+        du = min(max(du, -max_step), max_step)
+        dv = min(max(dv, -max_step), max_step)
+        u = min(max(u + du, 0.0), 1.0)
+        v = min(max(v + dv, 0.0), 1.0)
+        max_step = max(max_step * damp, 1e-4)
+        if du * du + dv * dv < tol:
+            break
+    return u, v, surf.evaluate(u, v)
+
+
+def ray_surface_intersect_ex(origin: "Point3D", direction: "Point3D",
+                             surf: "NURBSSurface", nu: int = 24, nv: int = 24,
+                             iters: int = 40, tol: float = 1e-10):
+    """
+    Intersect a forward ray with a NURBS surface: tessellation seed + Newton
+    refinement.
+
+    Phase 1 walks a triangle grid (Möller–Trumbore) to find the nearest forward
+    hit and its approximate ``(u, v)`` cell. Phase 2 refines it with the
+    iterative projection of Beer Alg. 3: project the current line point onto the
+    surface (closest-point, Alg. 2), slide along the line by the tangential
+    misfit ``(x_s − x_line)·dir``, repeat until the increment vanishes. The
+    result lies on the *true* surface, not on a facet.
+
+    Returns ``(point, t, u, v)`` or ``None`` when the ray misses.
+    """
+    dirn = direction.normalized()
     grid = surface_grid(surf, nu, nv)
-    best_t = None
-    best_p = None
+    best = None                      # (t, i, j)
     for i in range(nu):
         for j in range(nv):
             quad = [grid[i][j], grid[i][j + 1],
                     grid[i + 1][j + 1], grid[i + 1][j]]
             for tri in ((quad[0], quad[1], quad[2]),
                         (quad[0], quad[2], quad[3])):
-                t = ray_triangle_intersect(origin, direction, *tri)
-                if t is not None and (best_t is None or t < best_t):
-                    best_t = t
-                    best_p = origin + direction * t
-    return best_p
+                t = ray_triangle_intersect(origin, dirn, *tri)
+                if t is not None and (best is None or t < best[0]):
+                    best = (t, i, j)
+    if best is None:
+        return None
+
+    t, ci, cj = best
+    u = (ci + 0.5) / nu
+    v = (cj + 0.5) / nv
+    for _ in range(iters):
+        x_line = origin + dirn * t
+        u, v, xs = surface_closest_point(surf, x_line, u, v, iters=25)
+        dt = (xs - x_line).dot(dirn)
+        t += dt
+        if abs(dt) < tol:
+            break
+    if t <= 1e-9:
+        return None
+    return surf.evaluate(u, v), t, u, v
+
+
+def ray_surface_intersect(origin: "Point3D", direction: "Point3D",
+                          surf: "NURBSSurface", nu: int = 24, nv: int = 24):
+    """
+    Nearest forward ray–surface intersection point (or ``None``).
+
+    Convenience wrapper over :func:`ray_surface_intersect_ex` — tessellation
+    seed followed by Newton refinement, so the returned point lies on the true
+    surface rather than on a facet.
+    """
+    hit = ray_surface_intersect_ex(origin, direction, surf, nu, nv)
+    return hit[0] if hit is not None else None
 
 
 def tessellate_surface_trim(surf: "NURBSSurface", plane: "TrimPlane",
@@ -512,6 +599,255 @@ def tessellate_surface_trim(surf: "NURBSSurface", plane: "TrimPlane",
                 for kept in _clip_triangle_keep(tri, plane):
                     triangles.append(tuple(_add(p) for p in kept))
     return points, triangles
+
+
+def surface_normal(surf: "NURBSSurface", u: float, v: float) -> "Point3D":
+    """Unit surface normal ``Su × Sv`` at ``(u, v)`` (z-up fallback if singular)."""
+    _s, su, sv = surface_derivatives(surf, u, v)
+    n = su.cross(sv)
+    length = n.length()
+    return n * (1.0 / length) if length > 1e-12 else Point3D(0, 0, 1)
+
+
+def surface_directional_derivs(surf: "NURBSSurface", u: float, v: float,
+                               d3: "Point3D", h: float = 1e-3):
+    """
+    First and second derivatives of the surface along a *3D tangent direction*.
+
+    ``d3`` (unit, in the tangent plane) is converted to the parameter velocity
+    ``(du, dv)`` with unit 3D speed by solving the 2×2 Gram system
+    ``[Su·Su  Su·Sv; Su·Sv  Sv·Sv] (du,dv) = (d3·Su, d3·Sv)``, then the walk
+    ``t ↦ S(u+t·du, v+t·dv)`` is differentiated: analytically for the first
+    derivative, by central differences for the second. These drive the
+    curvature-continuous (G2) Hermite blend construction.
+
+    Returns ``(D1, D2, du, dv)``.
+    """
+    _s, su, sv = surface_derivatives(surf, u, v)
+    a11 = su.dot(su)
+    a12 = su.dot(sv)
+    a22 = sv.dot(sv)
+    b1 = d3.dot(su)
+    b2 = d3.dot(sv)
+    det = a11 * a22 - a12 * a12
+    if abs(det) < 1e-18:
+        du, dv = (b1 / a11 if a11 > 1e-18 else 0.0), 0.0
+    else:
+        du = (b1 * a22 - b2 * a12) / det
+        dv = (b2 * a11 - b1 * a12) / det
+    d1 = su * du + sv * dv
+    p_m = surf.evaluate(min(max(u - du * h, 0.0), 1.0),
+                        min(max(v - dv * h, 0.0), 1.0))
+    p_0 = surf.evaluate(u, v)
+    p_p = surf.evaluate(min(max(u + du * h, 0.0), 1.0),
+                        min(max(v + dv * h, 0.0), 1.0))
+    d2 = (p_m - p_0 * 2.0 + p_p) * (1.0 / (h * h))
+    return d1, d2, du, dv
+
+
+class SurfaceCutter:
+    """
+    A NURBS surface used as a *cutting tool*, duck-typed like :class:`TrimPlane`.
+
+    ``signed_distance(p)`` projects ``p`` onto the surface (closest-point
+    iteration, warm-started from the previous query) and signs the residual by
+    the surface normal at the foot point:  ``(p − foot) · n̂``. Positive = the
+    normal side. With this one method the whole plane-trim machinery — edge
+    splitting, face classification, section-curve marching — works unchanged
+    against a curved NURBS cutter (that is the NURBS ∩ NURBS realisation).
+
+    ``flip=True`` negates the sign, giving 'keep below' against the cutter.
+    """
+
+    def __init__(self, surf: "NURBSSurface", flip: bool = False):
+        self.surf = surf
+        self.flip = flip
+        self._seed = (0.5, 0.5)
+
+    def signed_distance(self, p: "Point3D") -> float:
+        u, v, foot = surface_closest_point(self.surf, p,
+                                           self._seed[0], self._seed[1],
+                                           iters=30)
+        self._seed = (u, v)
+        d = (p - foot).dot(surface_normal(self.surf, u, v))
+        return -d if self.flip else d
+
+    def project(self, p: "Point3D"):
+        """Foot-point parameters ``(u, v, foot)`` of ``p`` on the cutter."""
+        u, v, foot = surface_closest_point(self.surf, p,
+                                           self._seed[0], self._seed[1],
+                                           iters=40)
+        self._seed = (u, v)
+        return u, v, foot
+
+    def __repr__(self) -> str:
+        return f"SurfaceCutter(NURBS {self.surf.n_u}x{self.surf.n_v}, flip={self.flip})"
+
+
+def surface_surface_section(surf_a: "NURBSSurface", surf_b: "NURBSSurface",
+                            nu: int = 24, nv: int = 24):
+    """
+    NURBS ∩ NURBS: intersection curve(s) of two surfaces.
+
+    Realised by reusing the plane-section machinery with a
+    :class:`SurfaceCutter`: surface B becomes a signed-distance field over
+    surface A's ``(u, v)`` grid (closest-point projection + normal sign), and
+    :func:`surface_plane_section` marches/refines the zero level set. Each
+    intersection point is then projected onto B as well, so the curve is
+    returned in *all three* representations — 3D, A's parameters, and B's
+    parameters (the classic triple of the B-rep intersection problem).
+
+    Returns a list of ``(closed, pts)`` with ``pts`` a list of
+    ``(uA, vA, uB, vB, Point3D)``.
+    """
+    cutter = SurfaceCutter(surf_b)
+    branches = surface_plane_section(surf_a, cutter, nu, nv)
+    out = []
+    for closed, pts in branches:
+        enriched = []
+        for ua, va, p in pts:
+            # Tighten onto the true intersection by alternating projections
+            # between the two surfaces (converges for transversal crossings).
+            ub, vb = 0.5, 0.5
+            for _ in range(4):
+                ub, vb, foot_b = surface_closest_point(surf_b, p, ub, vb, iters=25)
+                ua, va, p = surface_closest_point(surf_a, foot_b, ua, va, iters=25)
+            ub, vb, foot_b = surface_closest_point(surf_b, p, ub, vb, iters=25)
+            enriched.append((ua, va, ub, vb, (p + foot_b) * 0.5))
+        out.append((closed, enriched))
+    return out
+
+
+def surface_plane_section(surf: "NURBSSurface", plane: "TrimPlane",
+                          nu: int = 32, nv: int = 32, tol: float = 1e-9):
+    """
+    Extract the intersection curve(s) of a NURBS surface with a plane, as
+    polylines in the surface's own ``(u, v)`` parameter space.
+
+    Marching squares over the signed-distance field ``d(u,v)`` sampled on a
+    ``nu×nv`` grid: each sign-change grid edge yields one crossing, refined by
+    bisection *on the true surface* along that grid line; each cell links its
+    crossings into segments; segments are chained into polylines.
+
+    Returns a list of ``(closed, pts)`` where ``pts`` is an ordered list of
+    ``(u, v, Point3D)`` and ``closed`` says whether the chain is a loop. This is
+    the parametric reconnection of the intersection: the curve is expressed in
+    the surface's own parameters, ready to be re-evaluated or lifted into the
+    topology as a section loop.
+    """
+    d = [[plane.signed_distance(surf.evaluate(i / nu, j / nv))
+          for j in range(nv + 1)] for i in range(nu + 1)]
+    # Symbolic perturbation: a section passing exactly through a grid node makes
+    # both incident edge products vanish and breaks the chain; nudge exact zeros
+    # onto the + side so every crossing stays detectable.
+    _EPS = 1e-12
+    for i in range(nu + 1):
+        for j in range(nv + 1):
+            if abs(d[i][j]) < _EPS:
+                d[i][j] = _EPS
+
+    def _refine_u(i0: int, i1: int, j: int):
+        """Bisect along u between grid columns i0,i1 at row j (on the surface)."""
+        v = j / nv
+        lo, hi = i0 / nu, i1 / nu
+        d_lo = d[i0][j]
+        for _ in range(50):
+            if hi - lo < 1e-12:
+                break
+            mid = 0.5 * (lo + hi)
+            dm = plane.signed_distance(surf.evaluate(mid, v))
+            if d_lo * dm <= 0.0:
+                hi = mid
+            else:
+                lo, d_lo = mid, dm
+        u = 0.5 * (lo + hi)
+        return u, v, surf.evaluate(u, v)
+
+    def _refine_v(i: int, j0: int, j1: int):
+        u = i / nu
+        lo, hi = j0 / nv, j1 / nv
+        d_lo = d[i][j0]
+        for _ in range(50):
+            if hi - lo < 1e-12:
+                break
+            mid = 0.5 * (lo + hi)
+            dm = plane.signed_distance(surf.evaluate(u, mid))
+            if d_lo * dm <= 0.0:
+                hi = mid
+            else:
+                lo, d_lo = mid, dm
+        v = 0.5 * (lo + hi)
+        return u, v, surf.evaluate(u, v)
+
+    # One crossing point per sign-change grid edge, keyed by that edge.
+    crossings = {}
+    for j in range(nv + 1):                       # u-direction grid edges
+        for i in range(nu):
+            if d[i][j] * d[i + 1][j] < -tol * tol:
+                crossings[("u", i, j)] = _refine_u(i, i + 1, j)
+    for i in range(nu + 1):                       # v-direction grid edges
+        for j in range(nv):
+            if d[i][j] * d[i][j + 1] < -tol * tol:
+                crossings[("v", i, j)] = _refine_v(i, j, j + 1)
+
+    # Link crossings cell by cell (marching squares).
+    links: dict = {k: [] for k in crossings}
+    for i in range(nu):
+        for j in range(nv):
+            cell = [k for k in (("u", i, j), ("u", i, j + 1),
+                                ("v", i, j), ("v", i + 1, j))
+                    if k in crossings]
+            if len(cell) == 2:
+                a, b = cell
+                links[a].append(b)
+                links[b].append(a)
+            elif len(cell) == 4:
+                # Saddle: resolve by the cell-centre sign so segments do not cross.
+                centre = plane.signed_distance(
+                    surf.evaluate((i + 0.5) / nu, (j + 0.5) / nv))
+                bottom, top = ("u", i, j), ("u", i, j + 1)
+                left, right = ("v", i, j), ("v", i + 1, j)
+                same = d[i][j] * centre > 0.0
+                pairs = ((bottom, left), (top, right)) if same else \
+                        ((bottom, right), (top, left))
+                for a, b in pairs:
+                    links[a].append(b)
+                    links[b].append(a)
+
+    # Chain the segment graph into polylines / loops.
+    visited = set()
+    chains = []
+    for start in crossings:
+        if start in visited or len(links[start]) != 1:
+            continue                              # open-chain endpoints first
+        chain = [start]
+        visited.add(start)
+        cur = start
+        while True:
+            nxt = [n for n in links[cur] if n not in visited]
+            if not nxt:
+                break
+            cur = nxt[0]
+            visited.add(cur)
+            chain.append(cur)
+        chains.append((False, chain))
+    for start in crossings:                       # remaining are closed loops
+        if start in visited:
+            continue
+        chain = [start]
+        visited.add(start)
+        cur = start
+        while True:
+            nxt = [n for n in links[cur] if n not in visited]
+            if not nxt:
+                break
+            cur = nxt[0]
+            visited.add(cur)
+            chain.append(cur)
+        chains.append((True, chain))
+
+    return [(closed, [crossings[k] for k in chain])
+            for closed, chain in chains if len(chain) >= 3]
 
 
 # --------------------------------------------------------------------------- #
