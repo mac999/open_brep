@@ -14,7 +14,7 @@ geometry, high-level modeling and the CLI.
 <img src="./doc/img5.png" height="120"></img>
 <img src="./doc/img6.png" height="120"></img>
 <img src="./doc/img7.png" height="120"></img> </br>
-<img src="./doc/img8.png" height="200"></img>
+<img src="./doc/img8.png" height="230"></img>
 </p>
 
 
