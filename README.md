@@ -16,6 +16,7 @@ geometry, high-level modeling and the CLI.
 <img src="./doc/img7.png" height="120"></img>
 </p>
 
+
 ## Why this exists
 
 Most CAD tutorials either hand-wave the kernel or hide it behind a giant library.
@@ -39,13 +40,17 @@ brep/
   mesh.py        Layer 3  Build a valid half-edge solid from a polygon mesh (sphere/cylinder)
   registry.py    Layer 4  Centralized immutable #id symbol table
   model.py                Kernel: owns the registry + all solids (the "Model")
+  xform.py       Layer 3  Whole-entity transforms (topology + attached geometry move together)
   validate.py             Euler-Poincare + pointer integrity checks
   view.py        View     Tabular / tree console formatting
   viewer.py      View     3-D interactive viewer (plotly → vedo → tkinter)
   controller.py  Controller  REPL + batch runner (cmd / shlex)
-  stepio.py      I/O      STEP (ISO 10303-21) export / best-effort import
+  webapp.py      Controller  Authoring web app: stdlib HTTP server on the live shell
+  web/                     Its front-end (index.html / app.js / styles.css) — no CDN, no build step
+  stepio.py      I/O      STEP (ISO 10303-21) export / import (rebuilds half-edge topology)
 main.py                   Entry point
-tests/test_kernel.py      Regression tests (assert Euler invariant on many shapes)
+tests/test_kernel.py         Regression tests (assert Euler invariant on many shapes)
+tests/test_step_roundtrip.py STEP save→load topology round-trip + web app API tests
 scripts/*.bcmd            Example batch command scripts
 ```
 
@@ -80,10 +85,18 @@ python main.py scripts/box.bcmd
 python main.py -q scripts/box.bcmd
 ```
 
+Open the authoring web app (also available as `webapp` at the prompt):
+
+```powershell
+python main.py --web          # http://127.0.0.1:8765/, then the REPL
+python main.py --web 9000     # on a specific port
+```
+
 Run the test suite:
 
 ```powershell
 python tests/test_kernel.py
+python tests/test_step_roundtrip.py
 ```
 
 ## Quick start
@@ -221,12 +234,62 @@ parameter details and examples.
 | `vars`                           | list aliases and`$last` entities                     |
 | `list`                           | summarize all solids                                   |
 | `run "<script>"`                 | execute commands from a file                           |
-| `save "<file.step>" [#solid]`    | export STEP (AP203 manifold B-rep)                     |
-| `load "<file.step>"`             | import CARTESIAN_POINTs                                |
+| `save "<file.step>" [#solid\|all]` | export STEP (AP203 manifold B-rep); `all` writes every solid |
+| `load "<file.step>" [points]`    | import STEP **as half-edge solids**; `points` for a vertex cloud |
+| `webapp [port] [nobrowser]`      | open the authoring web app on this session             |
 | `exit` / `quit`                | leave the REPL                                         |
 
 In scripts, blank lines and lines starting with `#` or `//` are comments. `//`
 also starts an inline comment (`#` cannot, since it collides with `#id`s).
+
+## Authoring web app
+
+`webapp` starts a small stdlib HTTP server (loopback only — it runs kernel
+commands) and opens a browser front-end **bound to the live REPL session**: one
+Kernel, one id registry, one alias table. A box added in the browser appears in
+`list` at the prompt; `trim @b by plane 1 1 1 15` typed at the prompt changes
+what the canvas draws on the next refresh. That sharing is the point — it makes
+B-Rep operations something you can watch while you test them.
+
+```
+brep> webapp
+web app serving at http://127.0.0.1:8765/
+```
+
+| Pane       | Contents                                                                      |
+| ---------- | ----------------------------------------------------------------------------- |
+| **left**   | add box / sphere / cylinder / plane / NURBS dome; move (fields + ±X/±Y/±Z nudge), rotate about the shape's own centroid, scale, delete |
+| **centre** | interactive canvas — drag rotate, wheel zoom, shift+drag pan, click to select — over a console that runs any CLI command |
+| **right**  | the selected solid's `#id`, V/E/F, rings, shells, genus, live Euler check, bounding box and centroid |
+| **top**    | STEP save / load (`교체` replaces the scene instead of merging)                |
+
+The front-end is a single dependency-free `canvas` renderer: the server
+tessellates each face (NURBS surfaces are sampled on a 14×14 grid) and the
+browser projects, depth-sorts and shades the triangles itself. No CDN, no npm,
+no build step.
+
+### Round-tripping through STEP
+
+The web app's save/load buttons write and read the same files the CLI's `save`
+and `load` use, so a shape authored in the browser comes back as **real half-edge
+topology** you can trim, blend, transform and validate:
+
+```
+brep> webapp                      // author a box + dome, press "STEP 저장"
+brep> load "model.step"
+loaded 2 solid(s) from model.step:
+  Solid #157 'box'    V=8 E=12 F=6
+  Solid #178 'nurbs'  V=4 E=4  F=2
+brep> check validity #157         // PASS
+brep> trim #157 by plane 1 1 1 15
+```
+
+`load` resolves `ADVANCED_FACE → FACE_BOUND → EDGE_LOOP → ORIENTED_EDGE →
+EDGE_CURVE → VERTEX_POINT → CARTESIAN_POINT` to recover each face's boundary
+vertex ring, then rebuilds the half-edge graph (edges, mates, loops) from those
+rings, merging vertices by coordinate to 1e-6. `B_SPLINE_SURFACE_WITH_KNOTS`
+records are re-attached to their faces, so a NURBS dome returns curved rather
+than faceted.
 
 ## Example gallery
 
@@ -509,6 +572,13 @@ plane), the analytic pcurve STEP export (one trimmed `ADVANCED_FACE`, 24
 `PCURVE`s, faceted fallback), KEV as the exact inverse of MEV, and that
 `move`/`rotate` transform the NURBS control nets together with the topology.
 
+`tests/test_step_roundtrip.py` closes the loop on I/O: box, sphere, cylinder and
+plane survive `save → load` with identical V/E/F and a passing Euler + pointer
+check; a restored NURBS dome evaluates to the same `S(u,v)` as the original at
+its corners and apex; a trimmed lamina comes back with only its keep half; and
+the web app's create / transform / console / save / load / delete endpoints are
+driven against a live server, asserting they all mutate the one shared kernel.
+
 ## Scope & limitations
 
 This is a teaching kernel, deliberately small:
@@ -550,8 +620,20 @@ This is a teaching kernel, deliberately small:
   re-fit NURBS patch.
 * **`revolve`** produces a faceted, valid solid with cylindrical-patch tags rather
   than an analytic surface of revolution.
-* **STEP import** rebuilds a vertex/point cloud, not the full half-edge graph
-  (export is a complete AP203 manifold B-rep).
+* **STEP import** rebuilds the half-edge graph (one solid per shell, B-spline
+  surfaces re-attached) — but only from each face's *outer* bound: inner bounds
+  (rings/holes) are skipped, rational (weighted) B-splines and the ISO
+  complex-record surface form are not parsed (those faces return planar), and
+  trim metadata (cutting plane, discarded flags) has no STEP representation, so
+  a trimmed shape returns as a plain open shell. `load "<f>" points` falls back
+  to a vertex cloud for files outside that envelope. Export is a complete AP203
+  manifold B-rep.
+* **The web app** authors primitives and transforms them; every other operation
+  (trim, extend, intersect, blend, the Euler micro-operators) is reached through
+  its console, which is the same command parser as the REPL. It is a testing
+  front-end for the kernel, not a general-purpose CAD UI: there is no undo, no
+  sub-entity (face/edge/vertex) selection, and no multi-user access — the server
+  binds to loopback only.
 
 # License
 MIT License
