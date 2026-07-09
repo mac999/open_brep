@@ -17,12 +17,12 @@ from . import euler_ops as eu
 from . import macro
 from . import stepio
 from . import view
+from . import xform
 from .geometry import (
     Bezier,
     NURBSSurface,
     Point3D,
     TrimPlane,
-    apply_matrix,
     rotation_matrix,
     scaling_matrix,
     translation_matrix,
@@ -47,6 +47,7 @@ class BRepShell(cmd.Cmd):
         "Try:  create box 10 10 10 as @b   then   check validity @b\n"
         "Refer to entities by #id, by @alias ('as @name' / 'set'), or by the\n"
         "last created of a kind: $solid $vertex $edge $face $loop $last ('vars').\n"
+        "'webapp' opens the authoring web app on this same kernel.\n"
     )
     PROMPT = "brep> "
     # cmd's own intro/prompt are silenced: we print them ourselves with an
@@ -747,65 +748,17 @@ class BRepShell(cmd.Cmd):
         self._out(f"scaled #{entity.oid} by {factor}")
 
     def _vertices_of(self, entity) -> List[Vertex]:
-        if isinstance(entity, Vertex):
-            return [entity]
-        if isinstance(entity, Edge):
-            return [entity.he1.vertex, entity.he1.end_vertex]
-        if isinstance(entity, Face):
-            seen, out = set(), []
-            for loop in entity.loops:
-                for v in loop.vertices():
-                    if v.oid not in seen:
-                        seen.add(v.oid)
-                        out.append(v)
-            return out
-        if isinstance(entity, Solid):
-            return list(entity.vertices)
-        raise CliError(f"#{entity.oid} cannot be transformed")
+        try:
+            return xform.vertices_of(entity)
+        except TypeError as exc:
+            raise CliError(str(exc))
 
     def _apply_transform(self, entity, matrix) -> None:
-        # Topology side: move every owned vertex.
-        for v in self._vertices_of(entity):
-            if v.point is not None:
-                v.point = apply_matrix(matrix, v.point)
-        # Geometry side: the attached NURBS control nets and Bezier control
-        # points must follow, or the surface/curve would detach from its
-        # boundary (topology and geometry always update together).
-        faces: List[Face] = []
-        edges: List[Edge] = []
-        if isinstance(entity, Solid):
-            faces = list(entity.faces)
-            edges = list(entity.edges)
-        elif isinstance(entity, Face):
-            faces = [entity]
-            edges = [he.edge for lp in entity.loops
-                     for he in lp.halfedges() if he.edge]
-        elif isinstance(entity, Edge):
-            edges = [entity]
-        for f in faces:
-            surf = getattr(f, "surface", None)
-            if isinstance(surf, NURBSSurface):
-                surf.control_net = [[apply_matrix(matrix, p) for p in row]
-                                    for row in surf.control_net]
-        seen = set()
-        for e in edges:
-            if e is None or e.oid in seen:
-                continue
-            seen.add(e.oid)
-            curve = getattr(e, "curve", None)
-            if isinstance(curve, Bezier):
-                curve.control_points = [apply_matrix(matrix, p)
-                                        for p in curve.control_points]
+        xform.apply_transform(entity, matrix)
 
     @staticmethod
     def _centroid(verts: List[Vertex]) -> Point3D:
-        pts = [v.point for v in verts if v.point is not None]
-        if not pts:
-            return Point3D(0, 0, 0)
-        sx = sum(p.x for p in pts) / len(pts)
-        sy = sum(p.y for p in pts) / len(pts)
-        sz = sum(p.z for p in pts) / len(pts)
-        return Point3D(sx, sy, sz)
+        return xform.centroid(verts)
 
     # ------------------------------------------------------------------ #
     # 4.5  Information & debugging
@@ -912,29 +865,79 @@ class BRepShell(cmd.Cmd):
         self._out(f"--- finished {path} ---")
 
     def do_save(self, arg: str) -> None:
-        'save "<file.step>" [#solid] [faceted]  - export a solid to STEP'
+        'save "<file.step>" [#solid|all] [faceted]  - export solid(s) to STEP'
         tokens = shlex.split(arg)
         faceted = False
         if tokens and tokens[-1].lower() == "faceted":
             faceted = True
             tokens = tokens[:-1]
         _expect(len(tokens) in (1, 2),
-                'usage: save "<file.step>" [#solid] [faceted]')
+                'usage: save "<file.step>" [#solid|all] [faceted]')
         path = tokens[0]
-        solid = self._resolve_solid(tokens[1:]) if len(tokens) == 2 else None
-        if solid is None:
+
+        if len(tokens) == 2 and tokens[1].lower() in ("all", "*"):
             _expect(bool(self.kernel.solids), "no solids to save")
-            solid = self.kernel.solids[0]
-        stepio.save(solid, path, faceted=faceted)
+            solids = list(self.kernel.solids)
+        else:
+            solid = self._resolve_solid(tokens[1:]) if len(tokens) == 2 else None
+            if solid is None:
+                _expect(bool(self.kernel.solids), "no solids to save")
+                solid = self.kernel.solids[0]
+            solids = [solid]
+
+        stepio.save_solids(solids, path, faceted=faceted)
         mode = " (faceted trim shells)" if faceted else ""
-        self._out(f"saved solid #{solid.oid} -> {path}{mode}")
+        ids = ", ".join(f"#{s.oid}" for s in solids)
+        self._out(f"saved {len(solids)} solid(s) [{ids}] -> {path}{mode}")
 
     def do_load(self, arg: str) -> None:
-        'load "<file.step>"  - import points from a STEP file'
+        'load "<file.step>" [points]  - import a STEP file as B-rep solid(s)'
         tokens = shlex.split(arg)
-        _expect(len(tokens) == 1, 'usage: load "<file.step>"')
-        solid = stepio.load(self.kernel, tokens[0])
-        self._out(f"loaded -> {solid.name} (solid #{solid.oid})")
+        points_only = False
+        if len(tokens) == 2 and tokens[1].lower() == "points":
+            points_only = True
+            tokens = tokens[:-1]
+        _expect(len(tokens) == 1, 'usage: load "<file.step>" [points]')
+
+        if points_only:
+            solid = stepio.load_points(self.kernel, tokens[0])
+            self._out(f"loaded vertex cloud -> {solid.name} (solid #{solid.oid})")
+            return
+
+        solids = stepio.load(self.kernel, tokens[0])
+        self._out(f"loaded {len(solids)} solid(s) from {tokens[0]}:")
+        for s in solids:
+            self._out(f"  Solid #{s.oid} '{s.name}'  "
+                      f"V={s.num_vertices} E={s.num_edges} F={s.num_faces}")
+
+    # ------------------------------------------------------------------ #
+    # 4.6b  Authoring web app
+    # ------------------------------------------------------------------ #
+    def do_webapp(self, arg: str) -> None:
+        "webapp [port] [nobrowser]  - open the authoring web app on this session"
+        tokens = shlex.split(arg)
+        open_browser = True
+        if tokens and tokens[-1].lower() in ("nobrowser", "-n"):
+            open_browser = False
+            tokens = tokens[:-1]
+        _expect(len(tokens) <= 1, "usage: webapp [port] [nobrowser]")
+        port = 8765
+        if tokens:
+            _expect(tokens[0].isdigit(), f"'{tokens[0]}' is not a port number")
+            port = int(tokens[0])
+
+        from . import webapp
+        already = webapp.is_running()
+        try:
+            url = webapp.start(self, port=port, open_browser=open_browser)
+        except OSError as exc:
+            raise CliError(f"cannot start the web app: {exc}")
+        self._out(
+            (f"web app already running at {url}" if already
+             else f"web app serving at {url}")
+            + "\n  it shares THIS session's kernel: shapes you author in the browser\n"
+              "  appear in 'list' here, and commands typed here show up on refresh."
+        )
 
     # ------------------------------------------------------------------ #
     # Exit
@@ -1604,13 +1607,49 @@ class BRepShell(cmd.Cmd):
           check validity $solid     // check last created solid
         """)
 
+    def help_webapp(self) -> None:
+        self._h(f"""
+        webapp [port] [nobrowser]
+        {self._HR}
+        Start the authoring web app and open it in the default browser.
+          [port]        TCP port (default 8765; if taken, the OS picks a free one)
+          [nobrowser]   start the server but do not open a browser
+
+        The server binds to 127.0.0.1 only -- it runs kernel commands, so it is
+        never exposed to the network.
+
+        It drives THIS shell: one Kernel, one id registry, one alias table.
+          * a box you add in the browser shows up in 'list' at this prompt
+          * 'trim @b by plane 1 1 1 15' typed here changes what the canvas draws
+            on the next refresh (the browser's ↻ button)
+          * the browser's console runs the same commands as this REPL
+
+        Web app layout:
+          left    add box/sphere/cylinder/plane/nurbs; move, rotate, scale, delete
+          centre  interactive canvas (drag rotate, wheel zoom, shift+drag pan,
+                  click to select) over a CLI console
+          right   the selected solid's id, V/E/F, rings, genus, Euler check,
+                  bounding box and centroid
+
+        STEP save/load in the top bar writes and reads the same files the CLI's
+        'save'/'load' commands use, so a shape authored in the browser can be
+        re-opened here as real B-rep topology and trimmed, blended or validated:
+
+          brep> webapp                      // author a box + dome, save "s.step"
+          brep> load "s.step"               // back as half-edge solids
+          brep> check validity $solid
+          brep> trim $solid by plane 1 1 1 15
+        """)
+
     def help_save(self) -> None:
         self._h(f"""
-        save "<file.step>" [#solid] [faceted]
+        save "<file.step>" [#solid|all] [faceted]
         {self._HR}
-        Export a solid to STEP AP203 format.
+        Export solid(s) to STEP AP203 format.
           "<file.step>"  output file path (quotes required if path has spaces)
           [#solid]       optional solid to save; defaults to the first solid
+          [all]          save every solid in the session into one file
+                         (this is what the web app's 'STEP 저장' button does)
           [faceted]      export trimmed NURBS faces as keep-side triangle
                          shells instead of analytic trimmed B-splines (for
                          viewers with weak pcurve support)
@@ -1628,6 +1667,7 @@ class BRepShell(cmd.Cmd):
           save "box.step"                 // save first solid
           save "out/nurbs.step" @dome     // save aliased solid
           save "scripts/out.step" $solid  // save last solid
+          save "scene.step" all           // every solid, one file
 
         Trim + save workflow:
           create nurbs 20 8 as @n
@@ -1637,17 +1677,40 @@ class BRepShell(cmd.Cmd):
 
     def help_load(self) -> None:
         self._h(f"""
-        load "<file.step>"
+        load "<file.step>" [points]
         {self._HR}
-        Import CARTESIAN_POINT / VERTEX_POINT entities from a STEP file
-        into a new solid as a vertex cloud.
+        Read a STEP file back into the kernel as real half-edge solids -- one
+        per CLOSED_SHELL / OPEN_SHELL in the file. This is the other half of
+        'save': a scene authored in the web app round-trips into topology you
+        can trim, blend, transform and validate here.
 
-        Note: full half-edge reconstruction from STEP is not supported;
-        only the point geometry is recovered.  The number of recovered
-        points is reported.
+        What is rebuilt:
+          ADVANCED_FACE -> FACE_BOUND -> EDGE_LOOP -> ORIENTED_EDGE ->
+          EDGE_CURVE -> VERTEX_POINT -> CARTESIAN_POINT
+        gives each face's boundary vertex ring; the half-edge graph (edges,
+        mates, loops) is rebuilt from those rings. Vertices are merged by
+        coordinate to 1e-6. B_SPLINE_SURFACE_WITH_KNOTS records are re-attached
+        to their faces, so a NURBS dome comes back curved, not faceted.
 
-        Example:
+        What is not:
+          * inner bounds (rings/holes) are skipped -- only outer bounds rebuild
+          * rational (weighted) B-splines and complex-record surface forms are
+            not parsed; those faces return untagged (planar)
+          * trim metadata (the cutting plane, discarded flags) is not stored in
+            STEP, so a trimmed shape returns as a plain open shell
+
+        [points]  ignore topology and import CARTESIAN_POINTs as a vertex cloud
+                  (the old behaviour; useful for files this kernel cannot map).
+
+        Examples:
           load "box.step"
+          check validity $solid
+          disp topology $solid
+
+          load "scene.step"               // the web app's multi-solid file
+          list
+
+          load "foreign.step" points      // just the coordinates
           disp vertices $solid
         """)
 

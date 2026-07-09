@@ -26,6 +26,7 @@ def build_solid_from_faces(
     faces: Sequence[Sequence[int]],
     name: str = "",
     surfaces: Optional[Sequence[Optional[NURBSSurface]]] = None,
+    closed: bool = True,
 ) -> Solid:
     """
     Construct a half-edge solid from ``points`` and ``faces``.
@@ -35,6 +36,12 @@ def build_solid_from_faces(
     edge must be shared by exactly two oppositely-wound faces (a closed manifold).
 
     ``surfaces[k]`` optionally attaches a NURBS surface to face k.
+
+    With ``closed=False`` the input may describe an *open* shell (a lamina, or
+    the surviving half of a trimmed solid): a half-edge with no opposite gets an
+    edge that owns it alone (``edge.he2 is None``), and a directed edge reused by
+    two same-wound faces is left unpaired instead of raising. Such a shell is not
+    a closed 2-manifold, so ``check_solid`` will report the boundary honestly.
     """
     solid = kernel.new_solid(name)
 
@@ -46,6 +53,7 @@ def build_solid_from_faces(
 
     # Build per-face loops; index every directed half-edge by (start, end).
     he_by_dir = {}
+    unpaired = []   # half-edges that can never find a twin (closed=False only)
     for fi, idx_loop in enumerate(faces):
         n = len(idx_loop)
         if n < 3:
@@ -58,14 +66,18 @@ def build_solid_from_faces(
         face_hes = []
         for k in range(n):
             a, b = idx_loop[k], idx_loop[(k + 1) % n]
-            if (a, b) in he_by_dir:
+            duplicate = (a, b) in he_by_dir
+            if duplicate and closed:
                 raise ValueError(
                     f"directed edge ({a},{b}) used twice - inconsistent winding")
             he = kernel.new_halfedge()
             he.vertex = verts[a]
             he.loop = loop
             face_hes.append(he)
-            he_by_dir[(a, b)] = he
+            if not duplicate:
+                he_by_dir[(a, b)] = he
+            else:
+                unpaired.append(he)
             if verts[a].halfedge is None:
                 verts[a].halfedge = he
 
@@ -83,11 +95,21 @@ def build_solid_from_faces(
             continue
         twin = he_by_dir.get((b, a))
         if twin is None:
-            raise ValueError(
-                f"open boundary: edge ({a},{b}) has no opposite face - not closed")
+            if closed:
+                raise ValueError(
+                    f"open boundary: edge ({a},{b}) has no opposite face - not closed")
+            unpaired.append(he)
+            continue
         edge = kernel.new_edge()
         edge.he1, edge.he2 = he, twin
         he.edge = twin.edge = edge
+        solid.add_edge(edge)
+
+    # Boundary half-edges of an open shell: an edge with a single use.
+    for he in unpaired:
+        edge = kernel.new_edge()
+        edge.he1, edge.he2 = he, None
+        he.edge = edge
         solid.add_edge(edge)
 
     return solid
