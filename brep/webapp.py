@@ -10,6 +10,10 @@ operations something you can see while you test them.
 
 Layout of the API (all JSON, all POST unless noted):
     GET  /api/scene           tessellated meshes + stats for every solid
+    GET  /api/entities        surviving face/edge/vertex ids per solid
+                              (fills the id pickers of the modeling-op menus)
+    GET  /api/entity?oid=N    geometric + topological detail of one
+                              face/edge/vertex (the right-hand props panel)
     POST /api/create          {kind, params}      -> build a primitive
     POST /api/delete          {oid}
     POST /api/transform       {oid, op, ...}      -> move / rotate / scale
@@ -37,8 +41,9 @@ from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import macro, stepio, xform
-from .geometry import (NURBSSurface, rotation_matrix, scaling_matrix,
+from .geometry import (Bezier, NURBSSurface, rotation_matrix, scaling_matrix,
                        translation_matrix)
+from .topology import Edge, Face, Vertex
 from .validate import check_solid
 from .viewer import _fan_tris, _nurbs_face_mesh, _surviving_refs
 
@@ -56,9 +61,13 @@ _NURBS_NU = _NURBS_NV = 14
 # Scene serialization
 # --------------------------------------------------------------------------- #
 def _solid_mesh(solid):
-    """Triangulate every surviving face into one (positions, triangles) buffer."""
+    """Triangulate every surviving face into one (positions, triangles) buffer.
+
+    Also returns the owning face oid per triangle so the canvas can pick faces.
+    """
     positions: List[List[float]] = []
     tris: List[List[int]] = []
+    tri_faces: List[int] = []
     for f in solid.faces:
         if getattr(f, "discarded", False) or f.outer is None:
             continue
@@ -73,13 +82,15 @@ def _solid_mesh(solid):
         base = len(positions)
         positions.extend([p.x, p.y, p.z] for p in pts)
         tris.extend([a + base, b + base, c + base] for a, b, c in face_tris)
-    return positions, tris
+        tri_faces.extend(f.oid for _ in face_tris)
+    return positions, tris, tri_faces
 
 
 def _solid_wire(solid):
-    """Line segments for every edge referenced by a surviving face."""
+    """Line segments (with edge oids) for every edge referenced by a surviving face."""
     _v_oids, e_oids = _surviving_refs(solid)
     segments = []
+    edge_oids = []
     for e in solid.edges:
         if e.oid not in e_oids or e.he1 is None:
             continue
@@ -88,11 +99,40 @@ def _solid_wire(solid):
             continue
         segments.append([[a.point.x, a.point.y, a.point.z],
                          [b.point.x, b.point.y, b.point.z]])
-    return segments
+        edge_oids.append(e.oid)
+    return segments, edge_oids
+
+
+def _solid_verts(solid):
+    """Positioned surviving vertices, for vertex picking/markers in the canvas."""
+    v_oids, _e_oids = _surviving_refs(solid)
+    return [{"oid": v.oid, "p": [v.point.x, v.point.y, v.point.z]}
+            for v in solid.vertices
+            if v.oid in v_oids and v.point is not None]
+
+
+def _face_grips(solid):
+    """One on-surface grip point per surviving face (the canvas pick handles).
+
+    A NURBS face's boundary centroid can float off the surface (a dome's four
+    base corners average to the base plane), so grips are evaluated on the
+    surface at the parametric middle instead.
+    """
+    grips = []
+    for f in solid.faces:
+        if getattr(f, "discarded", False) or f.outer is None:
+            continue
+        if isinstance(f.surface, NURBSSurface):
+            p = f.surface.evaluate(0.5, 0.5)   # components are numpy floats
+        else:
+            p = xform.centroid(xform.vertices_of(f))
+        grips.append({"oid": f.oid, "p": [float(p.x), float(p.y), float(p.z)]})
+    return grips
 
 
 def _solid_payload(solid) -> dict:
-    positions, tris = _solid_mesh(solid)
+    positions, tris, tri_faces = _solid_mesh(solid)
+    wire, wire_edges = _solid_wire(solid)
     lo, hi = xform.bounding_box(solid)
     centre = xform.centroid(solid.vertices)
     report = check_solid(solid)
@@ -102,7 +142,11 @@ def _solid_payload(solid) -> dict:
         "kind": (solid.name or "solid").split(":")[0].split("(")[0] or "solid",
         "positions": positions,
         "triangles": tris,
-        "wire": _solid_wire(solid),
+        "triFaces": tri_faces,
+        "wire": wire,
+        "wireEdges": wire_edges,
+        "verts": _solid_verts(solid),
+        "faceGrips": _face_grips(solid),
         "stats": {
             "v": solid.num_vertices, "e": solid.num_edges,
             "f": solid.num_faces, "rings": solid.num_rings,
@@ -117,6 +161,106 @@ def _solid_payload(solid) -> dict:
         "eulerRhs": report.euler_rhs,
         "pointerErrors": report.pointer_errors[:4],
     }
+
+
+def _entities_payload(kernel) -> List[dict]:
+    """Surviving face/edge/vertex ids per solid, for the web UI's id pickers.
+
+    Reuses the same survivor logic as the mesh/wire serializers so a trimmed
+    solid only offers ids the CLI commands can actually operate on.
+    """
+    out = []
+    for solid in kernel.solids:
+        v_oids, e_oids = _surviving_refs(solid)
+        faces = [{"oid": f.oid,
+                  "nurbs": isinstance(f.surface, NURBSSurface)}
+                 for f in solid.faces
+                 if not getattr(f, "discarded", False) and f.outer is not None]
+        out.append({
+            "oid": solid.oid,
+            "name": solid.name,
+            "faces": faces,
+            "edges": sorted(e_oids),
+            "vertices": sorted(v_oids),
+        })
+    return out
+
+
+def _face_mesh_one(face):
+    """(points, triangles) of a single face, same sampling as the scene mesh."""
+    if isinstance(face.surface, NURBSSurface):
+        return _nurbs_face_mesh(face, _NURBS_NU, _NURBS_NV)
+    pts = [he.vertex.point for he in face.outer.halfedges()
+           if he.vertex and he.vertex.point]
+    return pts, (_fan_tris(len(pts)) if len(pts) >= 3 else [])
+
+
+def _entity_detail(kernel, oid: int) -> dict:
+    """Geometric + topological properties of one sub-entity, for the props panel."""
+    entity = kernel.get(oid)
+    solid = kernel.solid_of(entity)
+    out = {"oid": oid, "solid": solid.oid if solid else None,
+           "solidName": solid.name if solid else None}
+
+    if isinstance(entity, Vertex):
+        p = entity.point
+        out.update({"type": "vertex",
+                    "point": [p.x, p.y, p.z] if p else None})
+        return out
+
+    if isinstance(entity, Edge):
+        a = entity.he1.vertex if entity.he1 else None
+        b = entity.he1.end_vertex if entity.he1 else None
+        curve = getattr(entity, "curve", None)
+        detail = {"type": "edge",
+                  "curve": (f"bezier (deg {curve.degree})"
+                            if isinstance(curve, Bezier) else "line"),
+                  "a": None, "b": None, "aOid": a.oid if a else None,
+                  "bOid": b.oid if b else None, "length": None, "centroid": None}
+        if a and b and a.point and b.point:
+            pa, pb = a.point, b.point
+            detail["a"] = [pa.x, pa.y, pa.z]
+            detail["b"] = [pb.x, pb.y, pb.z]
+            detail["length"] = ((pb.x - pa.x) ** 2 + (pb.y - pa.y) ** 2
+                                + (pb.z - pa.z) ** 2) ** 0.5
+            detail["centroid"] = [(pa.x + pb.x) / 2, (pa.y + pb.y) / 2,
+                                  (pa.z + pb.z) / 2]
+        out.update(detail)
+        return out
+
+    if isinstance(entity, Face):
+        # A trim leaves discarded faces in solid.faces; they have no boundary
+        # to mesh, so refuse them instead of crashing on face.outer.
+        if getattr(entity, "discarded", False) or entity.outer is None:
+            raise ValueError(f"face #{oid} has no surviving boundary")
+        centre = xform.centroid(xform.vertices_of(entity))
+        pts, tris = _face_mesh_one(entity)
+        area = 0.0
+        normal = [0.0, 0.0, 0.0]
+        for ia, ib, ic in tris:
+            pa, pb, pc = pts[ia], pts[ib], pts[ic]
+            u = (pb.x - pa.x, pb.y - pa.y, pb.z - pa.z)
+            v = (pc.x - pa.x, pc.y - pa.y, pc.z - pa.z)
+            n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
+                 u[0] * v[1] - u[1] * v[0])
+            area += 0.5 * (n[0] ** 2 + n[1] ** 2 + n[2] ** 2) ** 0.5
+            normal = [normal[i] + n[i] for i in range(3)]
+        n_len = (normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2) ** 0.5
+        surf = entity.surface
+        out.update({
+            "type": "face",
+            "surface": (f"nurbs (deg {surf.degree_u}x{surf.degree_v})"
+                        if isinstance(surf, NURBSSurface) else "plane"),
+            "loops": len(entity.loops),
+            "numVertices": len(xform.vertices_of(entity)),
+            "centroid": [centre.x, centre.y, centre.z],
+            "area": area,
+            "normal": ([normal[i] / n_len for i in range(3)]
+                       if n_len > 1e-12 else None),
+        })
+        return out
+
+    raise ValueError(f"#{oid} is not a vertex, edge or face")
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +393,18 @@ class _Handler(BaseHTTPRequestHandler):
                 solids = [_solid_payload(s) for s in self.kernel.solids]
             return self._json({"ok": True, "solids": solids,
                                "cwd": os.getcwd().replace("\\", "/")})
+        if path == "/api/entities":
+            with _LOCK:
+                solids = _entities_payload(self.kernel)
+            return self._json({"ok": True, "solids": solids})
+        if path == "/api/entity":
+            try:
+                oid = int(parse_qs(route.query).get("oid", [""])[0])
+                with _LOCK:
+                    detail = _entity_detail(self.kernel, oid)
+            except (ValueError, KeyError, TypeError) as exc:
+                return self._error(str(exc))
+            return self._json({"ok": True, "entity": detail})
         if path == "/api/files":
             root = parse_qs(route.query).get("dir", ["."])[0]
             try:

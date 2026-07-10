@@ -1625,7 +1625,12 @@ class BRepShell(cmd.Cmd):
           * the browser's console runs the same commands as this REPL
 
         Web app layout:
-          left    add box/sphere/cylinder/plane/nurbs; move, rotate, scale, delete
+          left    add box/sphere/cylinder/plane/nurbs; modeling ops menu that
+                  drives the SAME CLI commands (extrude, revolve, trim by
+                  plane/surface, trim surface window, split edge, extend to
+                  plane/face, intersect, blend) with face/edge id pickers;
+                  inspect buttons (check validity, disp topology/vertices/math,
+                  list, vars); move, rotate, scale, delete
           centre  interactive canvas (drag rotate, wheel zoom, shift+drag pan,
                   click to select) over a CLI console
           right   the selected solid's id, V/E/F, rings, genus, Euler check,
