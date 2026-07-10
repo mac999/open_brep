@@ -651,7 +651,7 @@ This is a teaching kernel, deliberately small:
 MIT License
 
 # Author
-laputa99999@gmail.com
+Taewook Kang, Ph.D, laputa99999@gmail.com
 
 # Acknowledge
 Thanks for Prof Kunwoo Lee.
