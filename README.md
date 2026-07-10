@@ -21,6 +21,7 @@ geometry, high-level modeling and the CLI.
 </p>
 
 
+
 ## Why this exists
 
 Most CAD tutorials either hand-wave the kernel or hide it behind a giant library.
@@ -260,11 +261,13 @@ brep> webapp
 web app serving at http://127.0.0.1:8765/
 ```
 
+The left panel is ordered by workflow, simple to compound:
+
 | Pane       | Contents                                                                      |
 | ---------- | ----------------------------------------------------------------------------- |
-| **left**   | add box / sphere / cylinder / plane / NURBS dome; move (fields + ±X/±Y/±Z nudge), rotate about the shape's own centroid, scale, delete |
-| **centre** | interactive canvas — drag rotate, wheel zoom, shift+drag pan, click to select — over a console that runs any CLI command |
-| **right**  | the selected solid's `#id`, V/E/F, rings, shells, genus, live Euler check, bounding box and centroid |
+| **left**   | **1 Create** box / sphere / cylinder / plane / NURBS dome → **2 Select** picking mode (solid / face / edge / vertex — a canvas click picks that entity type, and the ops and props follow it) → **3 Edit** move (fields + ±X/±Y/±Z nudge, applies to the picked sub-entity too), rotate about the shape's own centroid, scale, delete → **4 Sweep** (one shape: extrude, revolve) → **5 Combine** (two shapes: trim by plane / by NURBS face / (u,v) window, split edge, extend to plane / to face, intersect, blend) — all op menus drive the same CLI commands with id pickers; **inspect** buttons (check validity, disp topology / vertices / math, list, vars → output in the console) |
+| **centre** | interactive canvas — drag rotate, wheel zoom, shift+drag pan, click to select — with per-mode **pick grips** (circle = face centre, diamond = edge midpoint, square = vertex; colour-coded to the mode buttons, occlusion-culled, hidden while orbiting), hover pre-highlight + name tag, and a badge naming the active pick mode; a console below runs any CLI command |
+| **right**  | solids list (kind + V/E/F) and a properties panel: the solid's `#id`, V/E/F, rings, shells, genus, live Euler check, bounding box, centroid — plus the picked face (surface, loops, area, normal, centre), edge (curve, length, endpoints) or vertex; the editable bits (name, solid/face/edge centre, vertex position) apply through the shared kernel |
 | **top**    | STEP save / load (`교체` replaces the scene instead of merging)                |
 
 The front-end is a single dependency-free `canvas` renderer: the server
@@ -632,9 +635,14 @@ This is a teaching kernel, deliberately small:
   a trimmed shape returns as a plain open shell. `load "<f>" points` falls back
   to a vertex cloud for files outside that envelope. Export is a complete AP203
   manifold B-rep.
-* **The web app** authors primitives and transforms them; every other operation
-  (trim, extend, intersect, blend, the Euler micro-operators) is reached through
-  its console, which is the same command parser as the REPL. It is a testing
+* **The web app** authors primitives, transforms them, and exposes the modeling
+  commands (extrude, revolve, trim, extend, intersect, blend) and inspection
+  commands (check validity, disp, list, vars) as menus. Those menus do not have
+  their own back-end: each one assembles the corresponding CLI command line and
+  sends it through `POST /api/command` — the same `shell.onecmd()` dispatch as
+  the REPL — so parsing, validation and messages are reused verbatim (id pickers
+  are filled from `GET /api/entities`). Anything without a menu (e.g. the Euler
+  micro-operators) is still reachable through its console. It is a testing
   front-end for the kernel, not a general-purpose CAD UI: there is no undo, no
   sub-entity (face/edge/vertex) selection, and no multi-user access — the server
   binds to loopback only.
