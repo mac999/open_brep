@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>B-Rep Authoring Tool</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span>B-Rep Authoring Tool</span>
+      <span class="cwd" id="cwd"></span>
+    </div>
+    <div class="topbar-actions">
+      <input id="file-path" type="text" spellcheck="false" value="model.step"
+             aria-label="STEP file path">
+      <button id="btn-save" class="ghost">Save STEP</button>
+      <button id="btn-load" class="ghost">Load STEP</button>
+      <label class="chk"><input type="checkbox" id="load-replace"> replace</label>
+      <button id="btn-refresh" class="ghost" title="Reload the scene">Reload</button>
+    </div>
+  </header>
+
+  <main class="layout" id="layout">
+    <!-- ── left: modeling tools, ordered by workflow ────────────────
+         1 create → 2 select → 3 edit → 4 sweep → 5 combine → inspect -->
+    <aside class="panel left">
+      <section>
+        <h2><span class="step">1</span>Create</h2>
+        <div class="prim-tabs" id="prim-tabs"></div>
+        <div class="params" id="prim-params"></div>
+        <button id="btn-create" class="primary">+ Add</button>
+      </section>
+
+      <section>
+        <h2><span class="step">2</span>Select</h2>
+        <div class="mode-pick" id="sel-mode">
+          <button class="active" data-mode="solid">Solid</button>
+          <button data-mode="face">Face</button>
+          <button data-mode="edge">Edge</button>
+          <button data-mode="vertex">Vertex</button>
+        </div>
+        <div class="sel-status" id="sel-status">nothing selected</div>
+        <p class="hint">Click in the canvas to pick an entity of the active type. Ops and the properties panel follow the selection.</p>
+      </section>
+
+      <section>
+        <h2><span class="step">3</span>Edit</h2>
+        <h3 class="sub">Move</h3>
+        <div class="vec3">
+          <label>dx<input type="number" id="mv-x" value="0" step="1"></label>
+          <label>dy<input type="number" id="mv-y" value="0" step="1"></label>
+          <label>dz<input type="number" id="mv-z" value="0" step="1"></label>
+        </div>
+        <button id="btn-move" class="wide" disabled>Apply Move</button>
+        <div class="nudge">
+          <span>Step<input type="number" id="nudge-step" value="5" step="1"></span>
+          <div class="nudge-grid">
+            <button data-nudge="-1,0,0">-X</button><button data-nudge="1,0,0">+X</button>
+            <button data-nudge="0,-1,0">-Y</button><button data-nudge="0,1,0">+Y</button>
+            <button data-nudge="0,0,-1">-Z</button><button data-nudge="0,0,1">+Z</button>
+          </div>
+        </div>
+        <h3 class="sub">Rotate</h3>
+        <div class="row">
+          <div class="axis-pick" id="rot-axis">
+            <button class="active" data-axis="x">X</button>
+            <button data-axis="y">Y</button>
+            <button data-axis="z">Z</button>
+          </div>
+          <label class="grow">Angle<input type="number" id="rot-angle" value="45" step="5"></label>
+        </div>
+        <div class="row">
+          <button id="btn-rot-neg" class="wide" disabled>- Angle</button>
+          <button id="btn-rot-pos" class="wide" disabled>+ Angle</button>
+        </div>
+        <h3 class="sub">Scale / Delete</h3>
+        <div class="row">
+          <label class="grow">Factor<input type="number" id="scale-factor" value="1.5" step="0.1"></label>
+          <button id="btn-scale" disabled>Apply</button>
+        </div>
+        <button id="btn-delete" class="danger wide" disabled>Delete Selected</button>
+        <p class="hint" id="edit-hint">Move/Scale apply to the picked face, edge or vertex; Rotate/Delete apply to its solid.</p>
+      </section>
+
+      <section>
+        <h2><span class="step">4</span>Sweep <span class="h2-note">one shape</span></h2>
+        <select id="op-select-sweep" class="op-select" aria-label="Sweep operation"></select>
+        <div class="params op-params" id="op-params-sweep"></div>
+        <p class="hint" id="op-hint-sweep"></p>
+        <button id="btn-op-sweep" class="primary">Run Sweep</button>
+      </section>
+
+      <section>
+        <h2><span class="step">5</span>Combine <span class="h2-note">two shapes</span></h2>
+        <select id="op-select-combine" class="op-select" aria-label="Combine operation"></select>
+        <div class="params op-params" id="op-params-combine"></div>
+        <p class="hint" id="op-hint-combine"></p>
+        <button id="btn-op-combine" class="primary">Run Operation</button>
+      </section>
+
+      <section>
+        <h2>Inspect</h2>
+        <div class="row">
+          <button id="btn-validity" class="wide" title="check validity">Validity</button>
+          <button id="btn-topology" class="wide" title="disp topology">Topology</button>
+        </div>
+        <div class="row">
+          <button id="btn-vertices" class="wide" title="disp vertices">Vertices</button>
+          <button id="btn-list" class="wide" title="list">List</button>
+          <button id="btn-vars" class="wide" title="vars">Vars</button>
+        </div>
+        <div class="row">
+          <label class="grow">Entity (#id | @alias | $var)
+            <input type="text" id="disp-entity" value="$face" spellcheck="false">
+          </label>
+          <button id="btn-math" title="disp math">Math</button>
+        </div>
+        <p class="hint">Applies to the selected solid (or all solids when none is selected). Output appears in the console.</p>
+      </section>
+    </aside>
+
+    <div class="splitter" id="split-left" title="Drag to resize"></div>
+
+    <!-- ── centre: canvas + console ─────────────────────────────── -->
+    <section class="center">
+      <div class="canvas-wrap">
+        <canvas id="view"></canvas>
+        <div class="overlay-tl" id="scene-info">No solids</div>
+        <div class="overlay-mode" id="mode-chip">pick: solid</div>
+        <div class="overlay-tr">
+          <button data-shade="solid" class="active">Shaded</button>
+          <button data-shade="wire">Wire</button>
+          <button id="btn-fit">Fit</button>
+        </div>
+        <div class="overlay-bl">Drag: rotate &middot; Wheel: zoom &middot; Shift+Drag: pan &middot; Click: select / deselect &middot; Esc: step selection back</div>
+      </div>
+      <div class="console">
+        <div class="console-log" id="console-log"></div>
+        <form class="console-input" id="console-form">
+          <span class="prompt">brep&gt;</span>
+          <input id="console-line" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="Type a CLI command (e.g. trim @b by plane 1 1 1 15)">
+        </form>
+      </div>
+    </section>
+
+    <div class="splitter" id="split-right" title="Drag to resize"></div>
+
+    <!-- ── right: solids + properties ───────────────────────────── -->
+    <aside class="panel right">
+      <section>
+        <div class="section-head">
+          <h2>Solids</h2>
+          <button id="btn-deselect" class="mini" disabled>Deselect</button>
+        </div>
+        <ul class="solid-list" id="solid-list"></ul>
+      </section>
+      <section class="grow-section">
+        <h2>Properties</h2>
+        <div id="props" class="props empty">Select a solid to inspect and edit it.</div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
